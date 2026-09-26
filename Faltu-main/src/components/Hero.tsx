@@ -1,4 +1,4 @@
-import { motion } from 'framer-motion';
+﻿import { motion } from 'framer-motion';
 import { ChevronDown } from 'lucide-react';
 
 export default function Hero() {
@@ -35,7 +35,7 @@ export default function Hero() {
             className="font-display font-700 text-4xl sm:text-5xl lg:text-6xl leading-tight text-white mb-6 tracking-tight"
           >
             Welcome to <br />
-            <span className="gradient-text text-glow">Bhustack3D</span>
+            <span className="gradient-text text-glow">GeoMesh</span>
           </motion.h1>
 
           {/* Subheading */}

@@ -1,0 +1,285 @@
+<USER_REQUEST>
+0. GROUND TRUTH — CURRENT STATE OF THE REPO (do not re-derive, this is audited fact)
+
+Before writing any code, internalize this. It comes from a static, evidence-based audit of the tracked Git tree (HEAD, 79 files). Do not assume any of this is different unless you re-verify it yourself first.
+
+Architecture: Single-file FastAPI monolith (Faltu-main/backend/main.py, ~1,376 lines) + SQLAlchemy ORM + SQLite (bhustack.db, committed). React 18 + Vite 5 + Three.js frontend in Faltu-main/src/. No microservices, no queue, no Docker/CI, everything synchronous in-request.
+
+Auth today: JWT (HS256) + bcrypt, hardcoded secret in backend/auth.py. Roles are a coarse string check (admin/ADMIN/surveyor/SURVEYOR) enforced only on /admin/* routes via _require_admin. New signups (POST /auth/signup) are always created with role="citizen".
+
+Data model (backend/models.py, 7 tables): users, locations, parcels, parcel_features (buildings), parcel_ownership, parcel_floors, parcel_flats. Cascades: deleting a floor deletes its flats (cascade="all, delete-orphan").
+
+ULPIN engine (real, backend/services/ulpin_generator.py): generate_ulpin(base, floor_number, unit_code), validate_ulpin, build_base_ulpin, check_spatial_overlap, weighted checksum digit. This is genuinely implemented — reuse it, do not rewrite it.
+
+ULPIN assignment today — already surveyor-gated:
+
+POST /admin/floors/{floor_id}/assign-ulpin — Bearer+role only. Builds base ULPIN from the parcel, generates, self-validates, persists floor_ulpin. Not idempotent — re-calling overwrites it (UI-only guard, not backend-enforced).
+POST /admin/flats/{flat_id}/assign-ulpin — Bearer+role only. Cleans unit number, generates ULPIN, does duplicate-check the exact unit_ulpin string against sibling flats in the same building (400 on collision), self-validates checksum, persists.
+⚠️ Known discrepancy: the flat-assignment docstring claims it runs the geometry-based overlap check (check_spatial_overlap), but the code only does an exact string-duplicate check. check_spatial_overlap is currently only called from scripts/seed_parcels.py, never from a live HTTP route. Floor assignment has no overlap check at all.
+
+AI layer today — labelled stub, not wired to any route: backend/services/ai_extraction.py (extract_footprints, estimate_floor_count) is imported only by seed scripts, never by main.py. It passes geometry through unchanged and estimates floor count via est_height/3. There is no AI suspicion/flagging system anywhere in the current code. You are building it from scratch.
+
+Citizen-facing flow today — public read-only, not a real "citizen portal" yet:
+
+GET /locations/search?q= — public, fuzzy search, ≤20 rows.
+GET /parcels/{ulpin_id} — public, full parcel record + GeoJSON envelope.
+GET /parcels/{ulpin_id}/validate — public, pure checksum validation.
+GET /parcels/{ulpin_id}/confidence — public, confidence tier.
+These are currently callable with no auth at all, and there is no endpoint that lets an authenticated citizen browse their own parcel/ULPIN specifically, and no floor/flat-level 3D lookup exposed outside /admin/*.
+
+Frontend today: AdminDashboard.tsx + pages/admin/{BuildingsView,FloorsView,FlatsView}.tsx are the surveyor drill-down UI (role-gated). ParcelDetailPage.tsx fetches parcel data directly. Marketing/globe/city 3D views exist but make no backend calls. There is no citizen "search → load my building in 3D" screen wired to floor/flat ULPIN data yet.
+
+Do not touch / do not regress: the 26 existing endpoints, the ULPIN checksum algorithm, the cascade delete behavior, the seed scripts, or the mock: true integration stubs (DigiLocker, bank KYC) — those are intentionally fake and out of scope for this task.
+
+1. GOAL OF THIS TASK
+
+Implement three connected capabilities on top of the existing codebase:
+
+Citizen role: after login, a citizen can search for an area / their parcel / their ULPIN, and load the corresponding 3D building model (down to floor level) in the viewer.
+Surveyor-as-master authority: a 3D ULPIN (for a building, floor, or flat) can only ever be generated/assigned by a user with the surveyor role — this must be enforced at the backend, not just hidden in the UI — and floors within a building must each carry a genuinely unique 3D ULPIN (no silent overwrite, no cross-floor collision).
+AI suspicion flagging: when a citizen-facing or surveyor-facing action touches a parcel/feature/floor/flat, an AI/heuristic check evaluates it for anomalies; if something looks suspicious, the record is immediately flagged and routed into a surveyor review queue — it must NOT silently pass through.
+2. ROLE MODEL — MAKE THIS EXPLICIT (currently implicit/string-based)
+
+Define exactly three roles and codify them as an enum, not a loose string comparison:
+
+Role	Can do
+citizen	Sign up/login. Search locations/parcels/ULPINs. View parcel + building + floor 3D data (read-only). View confidence/validation. Cannot create/edit/delete parcels, features, floors, flats. Cannot assign or regenerate any ULPIN.
+surveyor	Everything a citizen can do, PLUS: create/edit/delete parcel features (buildings), floors, flats. Exclusively allowed to generate and assign 3D ULPINs at building/floor/flat level. Resolve AI-flagged items (approve / reject / correct).
+admin	Superset of surveyor for platform administration (user management, seed/reset operations) — keep existing _require_admin semantics but rename the dependency to make the surveyor-vs-admin distinction explicit if they diverge.
+
+"Surveyor is master" — interpret and implement as: every mutation to a ULPIN-bearing record (feature/floor/flat creation, edit, delete, ULPIN assignment) requires a surveyor (or admin) token; a citizen token on any of those routes must return 403, not 401, with a clear detail message. Do not rely on frontend route-guarding alone — every one of these must be enforced with a backend dependency, mirroring the existing _require_admin pattern but named for clarity (e.g. _require_surveyor).
+
+3. FEATURE A — CITIZEN SEARCH → 3D BUILDING/FLOOR VIEW
+3.1 Backend
+Add GET /citizen/search?q= (Bearer, any authenticated role) — same fuzzy match as the existing public /locations/search, but scoped/annotated so the response can distinguish "parcels linked to this user" vs "general area results" once ownership data (parcel_ownership) matches the logged-in user's identity (email/name — check how parcel_ownership currently links to a user, and if it doesn't, add a nullable user_id FK to parcel_ownership in a migration-safe way consistent with the existing hand-written ALTER TABLE micro-migration pattern in main.py).
+Add GET /citizen/parcels/{ulpin_id}/buildings (Bearer) — returns the parcel's parcel_features with each feature's floor count and 3D bounding data needed by the Three.js viewer.
+Add GET /citizen/parcels/{ulpin_id}/features/{feature_id}/floors (Bearer) — read-only equivalent of the existing admin floors-with-nested-flats endpoint, but stripped of any fields a citizen shouldn't see (e.g. other owners' names on flats they don't own — decide and document the exact field redaction).
+Keep the existing public /parcels/* endpoints as-is for anonymous/public lookup; the new /citizen/* endpoints are for authenticated, richer results (e.g. "my ULPINs" filtering). Do not duplicate logic — factor shared query logic into an internal helper both route sets call.
+3.2 Frontend
+New citizen-facing page (e.g. pages/CitizenSearchPage.tsx): a search bar (area name / ULPIN / parcel ID) → results list → on select, load the building into the existing Three.js viewer, defaulting to the top-level building mesh, with a floor selector that queries /citizen/.../floors and highlights the selected floor's own 3D ULPIN and validation status.
+Reuse the existing 3D viewer components from the globe/city marketing views rather than building a new renderer — extend them to accept a "load this specific parcel/feature/floor" prop.
+Gate this route behind the existing AuthContext — redirect to login if no token; do not gate it behind the surveyor-only admin route guard.
+4. FEATURE B — SURVEYOR-EXCLUSIVE ULPIN AUTHORITY + PER-FLOOR UNIQUENESS
+4.1 Enforce surveyor-only at the backend (audit-verified gap: currently role-gated but not idempotency/uniqueness-safe)
+Confirm/keep POST /admin/floors/{floor_id}/assign-ulpin and POST /admin/flats/{flat_id}/assign-ulpin behind _require_surveyor (rename from _require_admin if you split the roles per §2).
+Fix the floor-assignment idempotency gap: add a backend guard so that if floor.floor_ulpin is already set, re-calling the endpoint returns 409 Conflict (not a silent overwrite) unless a force=true query param is passed by a surveyor explicitly re-issuing it — log/track the re-issue (e.g. previous_ulpin, reissued_at, reissued_by) rather than discarding history.
+Fix the flat-assignment discrepancy: either (a) actually call services.ulpin_generator.check_spatial_overlap from the live route as the docstring already claims it does, or (b) correct the docstring to match reality and clearly document that only exact-string duplicate checking runs. Prefer (a) since the function already exists and is tested via the seed script — wire it in.
+Per-floor uniqueness (explicit new requirement): add a uniqueness constraint (DB-level UNIQUE on parcel_floors.floor_ulpin where not null, plus an application-level check before insert) so two floors — even across different buildings on the same parcel — can never end up with the same 3D ULPIN. Same for parcel_flats.unit_ulpin scoped at minimum to the building, ideally globally unique across the platform (confirm against ulpin_generator's base-ULPIN construction, which should already make cross-building collisions astronomically unlikely, but add the DB constraint as a hard backstop).
+Add GET /admin/floors/{floor_id}/ulpin-history (surveyor/admin) returning any reissue history if you implement the force-reissue path above.
+4.2 Frontend
+In FloorsView.tsx/FlatsView.tsx, keep "Assign ULPIN" visible only to surveyor/admin sessions; on 409 from a re-assign attempt, surface a confirm dialog before sending force=true.
+5. FEATURE C — AI SUSPICION FLAGGING → SURVEYOR REVIEW QUEUE
+
+This is the most novel piece for the hackathon; the existing ai_extraction.py is explicitly a labelled stub and is not wired to any route. Build a real (rule-based is fine for SIH scope — you do not need a trained model to satisfy "AI feels like something is suspicious") flagging engine and wire it in.
+
+5.1 Data model changes
+
+Add to parcel_features, parcel_floors, and parcel_flats (all three, since suspicion can arise at any level):
+
+flag_status (enum: clean | flagged | under_review | resolved_ok | resolved_rejected, default clean)
+flag_reason (text, nullable — human-readable explanation of what tripped the check)
+flag_score (float, nullable — confidence/severity if you compute one)
+flagged_at (datetime, nullable)
+reviewed_by (FK → users.id, nullable)
+reviewed_at (datetime, nullable)
+review_notes (text, nullable — surveyor's resolution notes)
+
+Add these via the same hand-written ALTER TABLE ... ADD COLUMN try/except micro-migration pattern already used in main.py:37-42 for parcel_features.notes, so the change is safe against the already-committed bhustack.db.
+
+5.2 Suspicion rules engine (new module: backend/services/ai_flagging.py)
+
+Implement a function evaluate_suspicion(entity_type, entity, context) -> FlagResult covering at least these checks (document each as a named rule so it's demoable/explainable in the SIH pitch — judges will ask "how does the AI decide"):
+
+Geometric overlap — reuse check_spatial_overlap from ulpin_generator; if a new/edited feature's footprint overlaps an existing feature on a different parcel, flag it.
+Floor-count anomaly — if generate_building_floors/create_single_floor results in a floor count wildly inconsistent with the feature's height (reuse the est_height/3 heuristic already in the AI stub as a starting sanity bound), flag it.
+ULPIN checksum/format anomaly — any manually-entered or reissued ULPIN that structurally looks off (fails validate_ulpin on a soft pass, or reuses a base_ulpin inconsistent with the parcel it's attached to via _extract_base_ulpin), flag it.
+Ownership anomaly — a flat/floor edit or ULPIN assignment where owner_name/ownership data changes abruptly or conflicts with parcel_ownership, flag it.
+Rapid/duplicate reissue anomaly — repeated force-reissues of the same floor/flat ULPIN in a short window (ties into §4.1's reissue history), flag it.
+Unit-number pattern anomaly — flats whose unit_number doesn't match the expected naming convention already implemented in generate_flats ({floor}{seq:02d} / G{seq:02d} / B{abs(floor)}{seq:02d}), flag it as manually-entered and inconsistent.
+
+Each rule should return a reason string; if any rule fires, set flag_status="flagged", populate flag_reason (concatenate all firing reasons), flagged_at=now(), and — per the requirement "flags it immediately and requesting for surveyor to check it out" — this must happen synchronously in the same request that created/edited the record, not as a background job (the whole codebase is synchronous by design; stay consistent with that).
+
+5.3 Wire into existing mutation routes
+
+Call evaluate_suspicion(...) from inside these existing handlers, right before/after the DB commit:
+
+update_feature_attributes
+create_single_floor, generate_building_floors, update_floor
+create_single_flat, generate_flats, update_flat
+assign_floor_ulpin, assign_flat_ulpin
+5.4 New surveyor review-queue endpoints
+GET /admin/flags?status=flagged (surveyor/admin) — paged list of all flagged features/floors/flats across the platform, each with entity type, reason, score, timestamps.
+POST /admin/flags/{entity_type}/{entity_id}/resolve (surveyor/admin) — body {decision: "ok"|"rejected", notes?}; sets flag_status to resolved_ok/resolved_rejected, reviewed_by, reviewed_at, review_notes.
+A flagged record should still be visible to a citizen (read-only) but the UI should surface its flag_status honestly rather than hiding it — cadastral transparency is core to the SIH pitch; do not silently suppress flagged data from citizens, just mark it clearly as "under surveyor review."
+5.5 Frontend
+New surveyor-only page pages/admin/FlaggedReviewQueue.tsx — table of flagged items, filter by status/entity type, click-through to the relevant FloorsView/FlatsView detail with the flag reason and a resolve action.
+Citizen-facing viewer (§3.2): show a small badge/icon on any floor or flat currently flagged/under_review, with a tooltip explaining it's pending surveyor verification — do not expose the internal rule names, just a human-readable summary.
+6. NON-FUNCTIONAL REQUIREMENTS
+Every new/changed route needs a role-check test (citizen gets 403 on surveyor-only routes; surveyor succeeds).
+Do not weaken CORS or auth on any existing public endpoint while adding the new /citizen/* ones.
+Keep the hardcoded-secret and demo-password issues out of scope for this task (already flagged in the audit as pre-existing tech debt) — do not silently "fix" them as a side effect; if you think they should be fixed, call it out separately rather than bundling it into this feature work.
+Update backend/README_ARCHITECTURE.md's layer table: Layer 3 (AI extraction) moves from "STUB" to "Real (rule-based v1)" once §5 lands — be honest in the doc about it being heuristic, not ML, so the SIH write-up doesn't overclaim.
+Update src/services/api.ts to mirror every new endpoint (matching the existing pattern of a single typed API wrapper) and update schemas.py with the corresponding new Pydantic request/response models.
+7. ACCEPTANCE CRITERIA (what "done" looks like for the demo)
+A citizen account can log in, search an area/ULPIN, and see a 3D building with selectable floors, each showing its own unique 3D ULPIN and validation state.
+A citizen token hitting any ULPIN-assignment or floor/flat mutation route gets 403.
+A surveyor generating a duplicate/colliding floor or flat ULPIN gets blocked (409 on floor reissue without force, 400/duplicate-guard on flat collision, DB-level uniqueness as backstop) — no two floors ever end up sharing a 3D ULPIN.
+Creating/editing a feature, floor, or flat that trips any rule in §5.2 immediately sets flag_status="flagged" in the same request/response cycle (verifiable by checking the response body of the mutating call itself, not a separate poll).
+A surveyor can see a review queue of all flagged items and resolve each one, and the resolution is reflected back in the citizen-facing view's badge.
+8. FEATURE D — SURVEYOR "AUTO-ASSIGN ALL FLOOR ULPINS" BUTTON
+
+Right now a surveyor assigns a floor's 3D ULPIN one floor at a time via POST /admin/floors/{floor_id}/assign-ulpin. Add a one-click bulk action at the building level.
+
+8.1 Backend
+New route: POST /admin/parcels/{parcel_id}/features/{feature_id}/floors/assign-ulpin-bulk (surveyor/admin only, same _require_surveyor dependency as §2/§4).
+Behavior: iterate every ParcelFloor belonging to that feature (floor_number ascending, basements included), and for each one not yet assigned (floor_ulpin IS NULL), run the exact same generation + self-validation logic already used by assign_floor_ulpin (build base ULPIN via _extract_base_ulpin(parcel), generate_ulpin(base, floor.floor_number, "0000"), validate checksum, persist). Do not duplicate the logic inline — refactor the body of the existing single-floor handler into a shared internal function (e.g. _assign_floor_ulpin(floor, parcel, force=False)) and call it from both the single-floor route and this new bulk route.
+Respect the §4.1 idempotency guard: floors that already have a floor_ulpin are skipped by default, not overwritten. Accept an optional body {force: bool = false} — when true, reassign every floor (recording reissue history exactly as specified in §4.1: previous_ulpin, reissued_at, reissued_by).
+Response: a summary object, e.g. {feature_id, total_floors, assigned: [...], skipped_already_assigned: [...], failed: [...] } so the UI can show a clear result toast rather than a silent success.
+This bulk route must also run the §5 AI suspicion check (evaluate_suspicion) per floor, same as the single-floor path — bulk-assigning must not bypass flagging.
+8.2 Frontend
+In FloorsView.tsx (surveyor-only), add an "Auto-assign all floor ULPINs" button above the floor list. On click, call the bulk endpoint with force=false first; render the summary (assigned/skipped/failed counts). If any floors were skipped because they already have a ULPIN, offer a secondary "Reassign all anyway" action that re-calls with force=true behind a confirmation dialog (this is a destructive/history-generating action, so don't make it the default one-click path).
+9. FEATURE E — 3D HOLOGRAM: DIVIDE BUILDING INTO FLOORS AT STANDARD 3m HEIGHT
+9.1 Data model
+Add floor_height_m (float, default 3.0) to parcel_features — the standard per-floor height for that building, editable by surveyor, defaulting to 3.0m per normal construction convention. Keep it per-building (not global) so unusual buildings (double-height lobbies, etc.) can be adjusted later without a schema change.
+Optionally allow a per-floor override: parcel_floors.height_override_m (float, nullable) — if set, that floor uses its own height instead of the building default; leave this as a stretch goal, not required for the base demo.
+Add via the same ALTER TABLE ... ADD COLUMN try/except micro-migration pattern used elsewhere in main.py.
+9.2 Backend
+FeatureDetailResponse / FloorResponse schemas (schemas.py) gain floor_height_m and a computed elevation_base_m / elevation_top_m per floor (or let the frontend compute it — pick one place, don't duplicate the math in both layers). Recommended: compute server-side so the frontend viewer stays dumb and simply positions meshes at the numbers it's given.
+Elevation math (ground floor = floor_number 0 sits at y = 0):
+Floor n > 0: base = n * floor_height_m, top = base + floor_height_m.
+Floor 0 (ground): base = 0, top = floor_height_m.
+Basement floor n < 0 (e.g. -1, -2): stacks downward — base = n * floor_height_m (negative), top = base + floor_height_m.
+Expose this via the existing GET /admin/parcels/{parcel_id}/features/{feature_id}/floors and the new citizen-facing GET /citizen/parcels/{ulpin_id}/features/{feature_id}/floors from §3.1 — both should return the same elevation fields so one rendering component serves both portals.
+9.3 Frontend (Three.js hologram)
+Extend the building hologram/mesh component so that instead of rendering one solid extruded volume per building footprint, it renders one thin slab mesh per floor, extruded from the footprint polygon between elevation_base_m and elevation_top_m, stacked in order. This is what makes floor selection ("click floor 4") visually meaningful instead of just highlighting a number in a sidebar.
+Give the currently-selected floor a distinct material/opacity (e.g. solid + highlighted outline) and all other floors a translucent "hologram" material, consistent with whatever wireframe/hologram visual style the existing globe/city views already use — match that style, don't invent a new one.
+A flagged floor (per §5) should render with a distinct tint/badge in this same hologram (e.g. amber outline) regardless of selection state, in both the citizen viewer (§3.2) and the surveyor FloorsView 3D preview if one exists.
+10. FEATURE F — SURVEYOR CAN EDIT/CHANGE A BUILDING-LEVEL ULPIN, INCLUDING FOR FLAGGED BUILDINGS
+
+The current ULPIN model, per the audit, only persists ULPINs at floor level (parcel_floors.floor_ulpin) and flat level (parcel_flats.unit_ulpin) — there is no dedicated "building ULPIN" field on parcel_features today. Confirm this against the live models.py before writing code; if a building-level ULPIN field already exists under a different name, reuse it instead of adding a duplicate column.
+
+10.1 Data model
+Add building_ulpin (string, nullable, indexed) to parcel_features, plus the same reissue-history fields used elsewhere for consistency: building_ulpin_assigned_at, building_ulpin_reassigned_by (FK → users.id), and a lightweight history table or JSON column (building_ulpin_history) storing prior values with timestamps — reuse whatever pattern you chose for floor reissue history in §4.1/§8.1 rather than inventing a second one.
+10.2 Backend
+New route: PUT /admin/parcels/{parcel_id}/features/{feature_id}/ulpin (surveyor/admin only). Body: {ulpin: string} for a manual explicit value, or {action: "generate"} to auto-generate one via the existing generate_ulpin/_extract_base_ulpin machinery (building-level ULPIN should use the base ULPIN with a floor/unit segment convention that marks it as "whole building" — e.g. a reserved sentinel like floor_number=0, unit_code="BLDG", confirm the exact segment convention against ulpin_generator.py so it stays structurally valid and passes validate_ulpin).
+Unlike the floor/flat assignment routes, this route is explicitly a change/reassign endpoint, not a create-once endpoint — a surveyor can call it repeatedly to change the building's ULPIN. Every call:
+Validates the new/generated ULPIN via validate_ulpin (reject with 500/400 on checksum failure, consistent with existing routes).
+Checks for collisions against every other building's building_ulpin platform-wide (DB-level UNIQUE constraint as backstop, same pattern as §4.1's per-floor uniqueness).
+Appends the previous value to building_ulpin_history before overwriting — a change is never silently lossy.
+Runs the §5 evaluate_suspicion check on the new value (manual ULPIN entry is itself one of the anomaly triggers listed in §5.2 — "ULPIN checksum/format anomaly").
+If the building's current flag_status is flagged or under_review, a successful reassignment through this route should be treated as the surveyor's corrective action — set flag_status = "resolved_ok", reviewed_by = <current surveyor>, reviewed_at = now(), and auto-populate review_notes with something like "Resolved via building ULPIN reassignment" unless the surveyor supplies their own notes in the request body. This directly satisfies "flagged buildings can be reassigned the new ULPIN" as the resolution path, rather than requiring a separate call to /admin/flags/.../resolve afterward — though that endpoint should still work standalone for flags resolved without a ULPIN change (e.g. "reviewed, false alarm").
+10.3 Frontend
+In the surveyor's building detail view (wherever FeatureDetailResponse is currently rendered — likely inside BuildingsView.tsx or a building detail panel), add an editable ULPIN field with a "Generate" button (calls {action:"generate"}) and a manual-entry mode, both gated to surveyor/admin sessions.
+If the building is currently flagged, show its flag reason inline next to this field and make the reassign action visually read as "resolve by reassigning" (e.g. a confirm dialog: "This will reassign the building's ULPIN and mark this flag as resolved. Continue?") so the surveyor understands the dual effect before confirming.
+Show building_ulpin_history as a small expandable log (previous value, who changed it, when) for auditability — this is a cadastral record; surveyors and auditors will want to see it wasn't changed silently.
+11. FEATURE G — CONNECT new_frontend TO THE BACKEND (REPLACES THE LEGACY UI GOING FORWARD)
+11.1 Repo layout — updated ground truth
+
+The repo root (sibling to Faltu-main/) now also contains new_frontend/ — a newly built frontend that must become the actively wired UI. Faltu-main/ still contains the real backend (Faltu-main/backend/) and the legacy frontend (Faltu-main/src/, referred to throughout §1–10 above). Do not delete or break Faltu-main/src/ — leave it in place as reference/fallback — but all new wiring work in this section targets new_frontend/, not the old src/.
+
+11.2 Step 0 — Inventory new_frontend before changing anything
+
+Before wiring a single button, the agent must actually read the new_frontend codebase and produce a short internal inventory (this is the same "ground truth before code" discipline used for the backend in §0):
+
+Tech stack (package.json): framework, router, state management, existing HTTP client (axios/fetch wrapper), any .env/config file with an API base URL.
+Every page/route in the app, and every clickable element (button, form submit, link with an action, icon-button) on each page.
+Whether it already has any API integration stubbed in (even fake/mock), and what shape it expects (this reveals what the original frontend author intended to call).
+The 3D hologram/building-visualization component(s): confirm whether they currently render from a local/mock GeoJSON sample or already attempt a live fetch.
+Do not assume file/folder names mirror the legacy Faltu-main/src/ structure — new_frontend may be organized completely differently.
+11.3 Step 1 — Base connection: API client + auth
+Point new_frontend's HTTP client at the backend's actual base URL (confirm the dev port the FastAPI app runs on in Faltu-main/backend/, typically uvicorn on :8000; use an env var, e.g. VITE_API_BASE_URL, not a hardcoded string, so it's portable).
+Implement JWT auth wiring: login form posts to POST /auth/login, store the returned token (localStorage or an auth context — match whatever pattern new_frontend already leans toward), attach Authorization: Bearer <token> to every subsequent request, decode the role claim to drive role-based rendering (§13), and redirect unauthenticated users to login on any protected route.
+11.4 Step 2 — Full button-to-endpoint audit (the core of this task)
+
+Produce a literal table — button/action label → page → intended behavior → matching backend endpoint → status — covering every interactive element found in §11.2. Statuses are one of:
+
+Wired — already correctly calling a real backend endpoint.
+Needs wiring — endpoint already exists (in the 26 original routes, or any new one specified in §§3,4,5,8,10 above) but the frontend isn't calling it yet; wire it.
+Needs new backend endpoint — no matching endpoint exists anywhere. Create it in Faltu-main/backend/main.py/schemas.py following the exact same conventions already established in this document: mutation routes gated with _require_surveyor/_require_admin per §2's role model, read routes public or citizen-accessible per §3, new tables/columns added via the existing ALTER TABLE ... ADD COLUMN try/except micro-migration pattern.
+Do not leave any button unresolved. Every single one must end this task either wired to a real call, or explicitly and visibly disabled for a documented role/permission reason (never silently broken).
+11.5 "No dead buttons" rule
+
+Any button currently wired to a stub, a TODO, a console.log, or hardcoded mock data must be fixed to call the real backend. If you find one, fix it as part of this pass — do not leave it flagged for later. The end state is: click any button in new_frontend → real network request → real backend response → real UI update. No fake data anywhere in the demo path.
+
+12. SURVEYOR CONTROLS IN new_frontend: BULK ULPIN ASSIGN + BUILDING ULPIN CHANGE
+
+Locate the structurally equivalent building/floor management page(s) in new_frontend (do not assume it's named FloorsView/BuildingsView like the legacy app — find whatever new_frontend calls its surveyor building-detail screen).
+
+Bulk auto-assign button: wire to POST /admin/parcels/{parcel_id}/features/{feature_id}/floors/assign-ulpin-bulk from §8. Default call uses force:false; show the returned summary (assigned/skipped_already_assigned/failed counts) as a toast/result panel. If any were skipped, show a secondary "Reassign all anyway" action behind a confirmation dialog that re-calls with force:true.
+Building ULPIN change field: wire to PUT /admin/parcels/{parcel_id}/features/{feature_id}/ulpin from §10 — support both a "Generate" action ({action:"generate"}) and manual entry ({ulpin: "..."}"). If the building is currently flagged, the confirmation copy should make clear that reassigning also resolves the flag (per §10.2 step 5), and show building_ulpin_history as an expandable audit log.
+Both controls are surveyor/admin-only in the UI (hidden entirely for citizens, per §13) — but this UI gating is not the real security boundary; the backend _require_surveyor dependency is what actually enforces it, and that must already be true from §4/§10.
+13. CITIZEN ROLE IN new_frontend: STRICTLY READ-ONLY
+A citizen-authenticated session must see: area/ULPIN search, parcel/building/floor 3D view, per-floor flag badges (§5.5), and validation/confidence info. It must not see any assign/generate/edit/resolve/reassign controls anywhere in the UI — hide them entirely rather than rendering them disabled, so a citizen never wonders why a button doesn't work.
+If a citizen manually navigates to a surveyor-only route/URL, the frontend must redirect them away (to their own dashboard or a clear "not authorized" screen) — but treat this as a UX nicety only. The real boundary is still the backend's 403 on every mutation route (§2/§4/§10); never rely on hidden buttons as the actual security control.
+14. VERIFY THE HOLOGRAM IS ACTUALLY WIRED TO LIVE BACKEND DATA
+
+You mentioned the hologram was already crafted on the backend side (§9's elevation math) — this step confirms new_frontend's 3D viewer is actually consuming it, not still rendering a local sample.
+
+Locate the hologram/building-visualization component(s) in new_frontend.
+Confirm it fetches, per building: the parcel footprint (GeoJSON), the floor list with elevation_base_m/elevation_top_m/floor_height_m (§9.2), each floor's flag_status (for tinting per §5.5/§9.3), and the floor/building ULPIN values for on-screen display — all from the live GET .../floors endpoints (citizen or admin variant depending on session role), not a bundled mock GeoJSON file.
+If it's currently rendering from a local/sample file, replace that data source with the real fetch and re-verify the visual result: individual 3m floor slabs stacked correctly (ground at y=0, basements stacking downward), selected floor highlighted, flagged floors tinted.
+Test against at least one real multi-floor parcel already in the seeded database (or the existing KP2_PARCEL.geojson/seed scripts referenced in the repo) to confirm the hologram genuinely divides into separate floor meshes rather than rendering one solid block — this was the whole point of §9.
+15. SEED TWO DEMO ACCOUNTS WITH FIXED CREDENTIALS
+
+Add a seed script (e.g. Faltu-main/backend/scripts/seed_demo_users.py) that creates exactly these two accounts if they don't already exist (idempotent — check by email before insert), using the existing auth.py password-hashing utility so they work through the normal POST /auth/login route — do not hand-roll a separate hashing scheme:
+
+Role	Email	Password
+Surveyor	surveyor.demo@bhustack3d.local	Surveyor@2026
+Citizen	citizen.demo@bhustack3d.local	Citizen@2026
+
+These are intentionally fixed, non-random values (not generated at runtime) specifically so they can be documented and reused for the SIH demo without depending on script output. After running the script, write these two rows into a DEMO_CREDENTIALS.md at the repo root, clearly labelled as demo-only accounts (not for production reuse). Confirm both log in successfully via new_frontend's login form and land on the correct role-specific dashboard (surveyor sees management controls per §12, citizen sees read-only view per §13).
+
+16. UPDATED ACCEPTANCE CRITERIA FOR THIS PASS
+Every interactive element in new_frontend is either wired to a real backend call or explicitly, visibly disabled with a role-based reason — none are dead/mocked.
+Any endpoint new_frontend needed but the backend didn't have has been added to Faltu-main/backend/main.py following the same role-gating and migration conventions already used throughout this document.
+Logging in as surveyor.demo@bhustack3d.local shows full management controls: bulk floor-ULPIN assignment (with skip/force behavior), building ULPIN edit/reassign (including flagged-building auto-resolve), and the flagged-items review queue.
+Logging in as citizen.demo@bhustack3d.local shows search + read-only 3D building/floor viewing with flag badges, and zero mutation controls anywhere, reachable or not.
+The hologram for a multi-floor building, viewed from new_frontend, loads real backend geometry/elevation/flag data and visually renders as stacked individual 3m floor slabs — not a static mock, not one solid block.
+DEMO_CREDENTIALS.md exists at the repo root with both accounts documented, and both successfully log in through new_frontend.
+17. FEATURE H — FIX "IDENTITY VALIDATION FAILED" ON THE ULPIN VALIDATE SCREEN (new_frontend / "GeoMesh 3D")
+
+Observed bug: on the public validate screen (deployed via ngrok in the screenshot, title "GeoMesh — 3D ... National Cadastral Registry Check"), entering BASE-V01-B01-CX and pressing VALIDATE returns "Identity validation failed — the submitted identifier does not match any authenticated 3D cadastral record", even though this exact string is offered as one of the page's own "verified specimen codes" chips (BASE-V07-U0704-CX, BASE-V01-B01-CX, BASE-V07-FL07-CX, UP-GNB-KP2-0442). A page suggesting a code as "verified" that then fails validation is either a real backend bug or — far more likely given everything found in §11.5 — hardcoded placeholder/mock strings in the frontend that were never actually seeded into the backend database. Diagnose properly before fixing; do not just silence the error.
+
+17.1 Step 0 — Reproduce and classify before touching code
+Open browser devtools on the deployed new_frontend (or local dev server), click one of the specimen chips, and inspect the actual network request made when VALIDATE is pressed:
+What URL is called — is it hitting GET /parcels/{ulpin_id}/validate (or a /citizen/... variant) on the real backend, or is it silently failing before any request goes out (e.g. CORS block, wrong base URL, request never fires)?
+What's the actual HTTP status and response body? 404/{valid:false} from a real backend call is a data problem (§17.2). A network error, CORS failure, or 500 is a wiring/config problem (§17.3). A generic frontend-only "failed" message with no network request at all means the validate button isn't actually wired yet (falls back to §11.5's "no dead buttons" rule — fix it there too).
+Do not assume which of these it is — check, then fix the one that's actually true. Report which category it turned out to be as part of the fix commit/notes.
+17.2 If it's a data problem — the specimen codes are fake/unseeded
+
+This is the most likely cause given the exact chip strings shown don't obviously match the real ULPIN structure produced by services/ulpin_generator.py (base ULPIN + floor/unit segment + weighted checksum digit, per §0's ground truth). Treat "a demo page shows codes that don't actually validate" as the same class of bug already called out in §11.5 (no fake data anywhere in the demo path) and fix it the same way:
+
+Do not hand-edit the frontend's hardcoded chip strings to whatever currently happens to be in the DB — that's a band-aid that breaks again the next time the DB is reseeded. Instead:
+Confirm (or run) the repo's existing seed scripts (Faltu-main/backend/scripts/seed_parcels.py and whatever populates KP2_PARCEL.geojson/kp2_EXPORTED.gpkg data referenced in the repo) so the database actually contains parcels/features/floors/flats with real, checksum-valid ULPINs end to end.
+Add a small backend endpoint, e.g. GET /public/sample-ulpins?limit=4 (public, no auth — this page is explicitly a public "National Cadastral Registry Check" screen) that returns a handful of real, currently-valid ULPINs pulled live from the database (mix of building/floor/flat level ones once §10's building-level field exists) — this is what powers the "Try verified specimen codes" chips.
+In new_frontend, replace the hardcoded chip array with a fetch to this new endpoint on page load. If the fetch fails or returns empty, hide the "try specimen codes" section entirely rather than showing stale hardcoded values — never show a code as "verified" that the page can't guarantee will actually validate.
+After this fix, clicking any chip must succeed and show a genuine "Identity Validated" success state, because the codes are now sourced live from whatever's actually in the database at that moment.
+17.3 If it's a wiring/config problem — CORS or wrong API base URL
+
+Given the deployment is behind an ngrok tunnel (*.ngrok-free.dev per the screenshot), specifically check:
+
+Backend CORS config (wherever CORSMiddleware/allowed origins is set in Faltu-main/backend/main.py) includes the ngrok origin actually in use, not just localhost. Ngrok's free-tier URL changes on every restart unless a reserved domain is used — if the team is repeatedly hitting this, consider either a wildcard for *.ngrok-free.dev during hackathon development (with a comment noting it must be tightened before any real deployment) or a documented step to update CORS/env config each time the tunnel URL changes.
+new_frontend's configured VITE_API_BASE_URL (or equivalent, per §11.3) actually points at the current backend tunnel/port and isn't left pointing at localhost while the frontend itself is being viewed through ngrok on a phone (as the screenshot suggests — a phone can't reach a laptop's localhost).
+If the request is reaching the backend but erroring server-side (500), check the validate route's handling of the exact string format submitted — confirm it trims whitespace and normalizes case (ULPINs display uppercase; if a user or the frontend submits mixed case and the backend does a case-sensitive lookup against an uppercase-stored value, that alone would explain sporadic "not found" results) before concluding it's purely a data issue.
+17.4 Error message quality (do this regardless of root cause)
+
+Once the real cause is fixed, still improve the failure path so this class of bug is easier to catch next time:
+
+Distinguish, in the UI, between "well-formed ULPIN, not found in registry" (true validation failure — keep current red state) vs "malformed ULPIN" (should say so specifically, e.g. "doesn't match expected ULPIN format") vs "couldn't reach the validation service" (network/CORS/server error — must never render as if it were a legitimate registry lookup result, since that's misleading in a national cadastral registry product).
+17.5 Acceptance criteria for this fix
+Every chip on the "Try verified specimen codes" row, when clicked, returns a genuine success/valid result — because the chips are now populated live from real seeded data, not hardcoded strings.
+Manually typing a real, currently-valid ULPIN (any level — building/floor/flat) into the search box and pressing VALIDATE also succeeds.
+Manually typing a garbage string produces a clearly-labelled "not found / malformed" result, not a misleading generic failure.
+If CORS/base-URL was part of the root cause, the deployed ngrok-tunneled new_frontend can reach the backend from an actual phone (not just from a laptop on the same network as the backend).
+</USER_REQUEST>
+<ADDITIONAL_METADATA>
+The current local time is: 2026-09-25T23:32:05+05:30.
+
+The user's current state is as follows:
+Other open documents:
+- c:\Users\ayush\OneDrive\Desktop\Bhustack3D\Faltu-main\src\pages\admin\BuildingsView.tsx (LANGUAGE_TSX)
+- c:\Users\ayush\OneDrive\Desktop\Bhustack3D\Faltu-main\src\components\Navbar.tsx (LANGUAGE_TSX)
+- c:\Users\ayush\OneDrive\Desktop\Bhustack3D\KP2_PARCEL.geojson (LANGUAGE_JSON)
+- c:\Users\ayush\OneDrive\Desktop\Bhustack3D\Faltu-main\backend\services\ai_extraction.py (LANGUAGE_PYTHON)
+- c:\Users\ayush\OneDrive\Desktop\Bhustack3D\Faltu-main\index.html (LANGUAGE_HTML)
+</ADDITIONAL_METADATA>

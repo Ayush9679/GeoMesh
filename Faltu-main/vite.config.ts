@@ -8,6 +8,7 @@ export default defineConfig({
     port: 5173,
     strictPort: true,
     host: true,
+    cors: true,
     proxy: {
       '/auth': {
         target: 'http://127.0.0.1:8000',
@@ -26,6 +27,10 @@ export default defineConfig({
         changeOrigin: true,
       },
       '/admin': {
+        target: 'http://127.0.0.1:8000',
+        changeOrigin: true,
+      },
+      '/citizen': {
         target: 'http://127.0.0.1:8000',
         changeOrigin: true,
       },
@@ -50,6 +55,7 @@ export default defineConfig({
     port: 5173,
     strictPort: true,
     host: true,
+    cors: true,
     proxy: {
       '/auth': {
         target: 'http://127.0.0.1:8000',
@@ -68,6 +74,10 @@ export default defineConfig({
         changeOrigin: true,
       },
       '/admin': {
+        target: 'http://127.0.0.1:8000',
+        changeOrigin: true,
+      },
+      '/citizen': {
         target: 'http://127.0.0.1:8000',
         changeOrigin: true,
       },

@@ -1,9 +1,9 @@
-# Layer 1 — Data Acquisition: Raw GeoJSON Inputs
+﻿# Layer 1 — Data Acquisition: Raw GeoJSON Inputs
 
 ## Purpose
 
 This `data/raw/` directory is the designated drop-zone for **Layer 1 output** in the
-7-layer Bhustack3D cadastral pipeline (SIH26011 architecture).
+7-layer GeoMesh cadastral pipeline (SIH26011 architecture).
 
 Each `.geojson` file placed here represents a parcel cluster digitized from satellite imagery
 (QGIS + OpenStreetMap/Google basemap workflow) and is the starting point for the

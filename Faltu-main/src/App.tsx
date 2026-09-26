@@ -13,6 +13,7 @@ import ErrorBoundary from './components/ErrorBoundary';
 import { AuthProvider } from './context/AuthContext';
 import ParcelDetailPage from './pages/ParcelDetailPage';
 import AdminDashboard from './pages/AdminDashboard';
+import CitizenSearchPage from './pages/CitizenSearchPage';
 import { LocationData } from './data/locations';
 
 function easeInOutCubic(t: number): number {
@@ -182,6 +183,7 @@ export default function App() {
           <Route path="/parcel/:parcelId" element={<ParcelDetailPage />} />
           <Route path="/explore/:parcelId" element={<ParcelDetailPage />} />
           <Route path="/admin" element={<AdminDashboard />} />
+          <Route path="/citizen" element={<CitizenSearchPage />} />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
       </BrowserRouter>

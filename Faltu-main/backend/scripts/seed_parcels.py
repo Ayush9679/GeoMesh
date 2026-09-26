@@ -1,4 +1,4 @@
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
 """
 backend/scripts/seed_parcels.py
 =================================
@@ -14,7 +14,7 @@ It is idempotent — safe to re-run; existing parcel records are skipped
 unless --force is passed.
 
 Architecture note:
-  Uses SQLite (bhustack.db) as the prototype database.
+  Uses SQLite (GEOMESH.db) as the prototype database.
   Production would use PostgreSQL + PostGIS 3D + 3DCityDB.
   See: backend/README_ARCHITECTURE.md
 """
@@ -47,7 +47,7 @@ def run_seed(force: bool = False) -> None:
     db = SessionLocal()
 
     print("\n" + "=" * 70)
-    print("  BHUSTACK3D — LAYER 4 DATABASE SEED (KP2 Full Pipeline)")
+    print("  GeoMesh — LAYER 4 DATABASE SEED (KP2 Full Pipeline)")
     print("=" * 70)
 
     # ── Load raw GeoJSON ────────────────────────────────────────────────────
@@ -239,7 +239,7 @@ def run_seed(force: bool = False) -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Bhustack3D Layer 4 — Seed KP2 parcel data from GeoJSON"
+        description="GeoMesh Layer 4 — Seed KP2 parcel data from GeoJSON"
     )
     parser.add_argument(
         "--force", action="store_true",

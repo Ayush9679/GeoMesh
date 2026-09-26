@@ -1,7 +1,9 @@
 import { useState, useEffect } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Menu, X } from 'lucide-react';
+import { Menu, X, ShieldCheck, User } from 'lucide-react';
+import { useNavigate } from 'react-router-dom';
 import Logo from './Logo';
+import { useAuth } from '../context/AuthContext';
 
 interface NavbarProps {
   onPortalAccess?: () => void;
@@ -10,6 +12,8 @@ interface NavbarProps {
 export default function Navbar({ onPortalAccess }: NavbarProps) {
   const [scrolled, setScrolled] = useState(false);
   const [menuOpen, setMenuOpen] = useState(false);
+  const { user, isAuthenticated, logout } = useAuth();
+  const navigate = useNavigate();
 
   useEffect(() => {
     const onScroll = () => setScrolled(window.scrollY > 40);
@@ -17,9 +21,11 @@ export default function Navbar({ onPortalAccess }: NavbarProps) {
     return () => window.removeEventListener('scroll', onScroll);
   }, []);
 
+  const isSurveyorOrAdmin = user && (user.role?.toLowerCase() === 'admin' || user.role?.toLowerCase() === 'surveyor');
+
   const navLinks = [
-    { label: 'Features', href: '#features' },
-    { label: 'About', href: '#footer' },
+    { label: 'Features', href: '/#features' },
+    { label: 'About', href: '/#footer' },
   ];
 
   return (
@@ -34,11 +40,11 @@ export default function Navbar({ onPortalAccess }: NavbarProps) {
       }`}
     >
       <div className="max-w-7xl mx-auto px-5 sm:px-8 flex items-center justify-between">
-        <a href="#hero" className="z-10">
+        <a href="/#hero" className="z-10">
           <Logo size="md" />
         </a>
 
-        <div className="hidden md:flex items-center gap-8">
+        <div className="hidden md:flex items-center gap-6">
           {navLinks.map((link) => (
             <a
               key={link.label}
@@ -49,12 +55,51 @@ export default function Navbar({ onPortalAccess }: NavbarProps) {
               <span className="absolute -bottom-1 left-0 w-0 h-0.5 bg-gradient-to-r from-accent-400 to-cyan-glow transition-all duration-300 group-hover:w-full" />
             </a>
           ))}
-          <button
-            onClick={onPortalAccess}
-            className="text-sm font-body font-500 px-5 py-2.5 rounded-lg bg-gradient-to-r from-accent-500 to-accent-600 text-white hover:from-accent-400 hover:to-accent-500 transition-all duration-300 hover:shadow-lg hover:shadow-accent-500/30"
-          >
-            Portal Access
-          </button>
+
+          {isAuthenticated ? (
+            <div className="flex items-center gap-3">
+              {isSurveyorOrAdmin ? (
+                <>
+                  <button
+                    onClick={() => navigate('/admin')}
+                    className="text-sm font-body font-500 px-4 py-2 rounded-lg bg-gradient-to-r from-accent-500 to-accent-600 text-white hover:from-accent-400 hover:to-accent-500 transition-all duration-300 hover:shadow-lg hover:shadow-accent-500/30"
+                  >
+                    Surveyor Dashboard
+                  </button>
+                  <button
+                    onClick={() => navigate('/citizen')}
+                    className="text-sm font-body font-500 px-3.5 py-2 rounded-lg border border-sky-400/30 text-sky-300 hover:bg-sky-500/10 transition-all duration-300"
+                  >
+                    Citizen View
+                  </button>
+                </>
+              ) : (
+                <button
+                  onClick={() => navigate('/citizen')}
+                  className="text-sm font-body font-500 px-4 py-2 rounded-lg bg-gradient-to-r from-sky-500 to-cyan-600 text-white hover:from-sky-400 hover:to-cyan-500 transition-all duration-300 hover:shadow-lg hover:shadow-sky-500/30"
+                >
+                  My Parcels
+                </button>
+              )}
+
+              <div className="flex items-center gap-2 pl-2 border-l border-white/10">
+                <span className="text-xs text-slate-400 max-w-[120px] truncate">{user?.name}</span>
+                <button
+                  onClick={() => logout()}
+                  className="text-xs text-slate-500 hover:text-red-400 transition-colors"
+                >
+                  Logout
+                </button>
+              </div>
+            </div>
+          ) : (
+            <button
+              onClick={onPortalAccess}
+              className="text-sm font-body font-500 px-5 py-2.5 rounded-lg bg-gradient-to-r from-accent-500 to-accent-600 text-white hover:from-accent-400 hover:to-accent-500 transition-all duration-300 hover:shadow-lg hover:shadow-accent-500/30"
+            >
+              Portal Access
+            </button>
+          )}
         </div>
 
         <button
@@ -86,15 +131,50 @@ export default function Navbar({ onPortalAccess }: NavbarProps) {
                   {link.label}
                 </a>
               ))}
-              <button
-                onClick={() => {
-                  setMenuOpen(false);
-                  onPortalAccess?.();
-                }}
-                className="text-sm font-body font-500 px-5 py-2.5 rounded-lg bg-gradient-to-r from-accent-500 to-accent-600 text-white text-left"
-              >
-                Portal Access
-              </button>
+
+              {isAuthenticated ? (
+                <>
+                  {isSurveyorOrAdmin ? (
+                    <>
+                      <button
+                        onClick={() => { setMenuOpen(false); navigate('/admin'); }}
+                        className="text-sm font-body font-500 px-4 py-2 rounded-lg bg-gradient-to-r from-accent-500 to-accent-600 text-white text-left"
+                      >
+                        Surveyor Dashboard
+                      </button>
+                      <button
+                        onClick={() => { setMenuOpen(false); navigate('/citizen'); }}
+                        className="text-sm font-body font-500 px-4 py-2 rounded-lg border border-sky-400/30 text-sky-300 text-left"
+                      >
+                        Citizen Explorer
+                      </button>
+                    </>
+                  ) : (
+                    <button
+                      onClick={() => { setMenuOpen(false); navigate('/citizen'); }}
+                      className="text-sm font-body font-500 px-4 py-2 rounded-lg bg-gradient-to-r from-sky-500 to-cyan-600 text-white text-left"
+                    >
+                      My Parcels
+                    </button>
+                  )}
+                  <button
+                    onClick={() => { setMenuOpen(false); logout(); }}
+                    className="text-xs text-red-400 text-left pt-2"
+                  >
+                    Logout ({user?.name})
+                  </button>
+                </>
+              ) : (
+                <button
+                  onClick={() => {
+                    setMenuOpen(false);
+                    onPortalAccess?.();
+                  }}
+                  className="text-sm font-body font-500 px-5 py-2.5 rounded-lg bg-gradient-to-r from-accent-500 to-accent-600 text-white text-left"
+                >
+                  Portal Access
+                </button>
+              )}
             </div>
           </motion.div>
         )}

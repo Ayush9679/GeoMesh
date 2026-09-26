@@ -1,4 +1,4 @@
-"""
+﻿"""
 backend/scripts/preprocess_geojson.py
 ========================================
 Layer 2 — Data Pre-processing Pipeline (REAL IMPLEMENTATION)
@@ -353,7 +353,7 @@ def preprocess(input_path: str, output_path: str | None = None) -> dict:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Bhustack3D Layer 2 — GeoJSON Pre-processing Pipeline"
+        description="GeoMesh Layer 2 — GeoJSON Pre-processing Pipeline"
     )
     parser.add_argument("input", help="Path to raw GeoJSON file from QGIS export")
     parser.add_argument(
@@ -362,7 +362,7 @@ def main() -> None:
     args = parser.parse_args()
 
     print("\n" + "=" * 70)
-    print("  BHUSTACK3D — LAYER 2: DATA PRE-PROCESSING PIPELINE")
+    print("  GeoMesh — LAYER 2: DATA PRE-PROCESSING PIPELINE")
     print("=" * 70)
     print(f"  Input:  {args.input}")
 

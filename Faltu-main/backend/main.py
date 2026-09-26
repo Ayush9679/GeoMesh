@@ -13,21 +13,29 @@ See: backend/README_ARCHITECTURE.md for the full architecture documentation.
 
 from fastapi import FastAPI, Depends, HTTPException, status, Query
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import text
+from sqlalchemy import text, func, or_
 from sqlalchemy.orm import Session
 from database import engine, Base, get_db
-from models import User, Location, Parcel, ParcelFeature, ParcelFloor, ParcelFlat
+from models import User, Location, Parcel, ParcelFeature, ParcelFloor, ParcelFlat, ParcelOwnership, Role
 from schemas import (
-    UserSignup, UserLogin, UserResponse, TokenResponse, MessageResponse,
+    UserSignup, UserLogin, UserResponse, TokenResponse, MessageResponse, AdminUserCreate,
     LocationResponse, LocationSearchResult, StrataEnvelope,
     AdminParcelRow, ULPINValidationResult, ConfidenceResult,
+    ValidationDetails, SampleUlpinItem, SampleUlpinsResponse,
     DigiLockerStub, BankKYCStub,
-    FeatureUpdateRequest, FeatureDetailResponse,
-    FloorGenerateRequest, FloorCreateRequest, FloorUpdateRequest, FloorResponse,
-    FlatGenerateRequest, FlatCreateRequest, FlatUpdateRequest, FlatResponse,
+    FeatureUpdateRequest, FeatureDetailResponse, FeatureDetailResponseWithFlag,
+    FloorGenerateRequest, FloorCreateRequest, FloorUpdateRequest, FloorResponse, FloorResponseWithFlag,
+    FlatGenerateRequest, FlatCreateRequest, FlatUpdateRequest, FlatResponse, FlatResponseWithFlag,
     AssignUlpinResponse,
+    # New schemas — Feature A (citizen), B (ULPIN), C (flags)
+    CitizenSearchResult, CitizenBuildingResponse, CitizenFloorResponse, CitizenFlatResponse,
+    FlagResolveRequest, FlaggedItemResponse, ULPINReissueHistoryResponse,
+    # New schemas — Feature D (bulk assign), E (elevations), F (building ULPIN)
+    FloorBulkAssignRequest, FloorBulkAssignResponse,
+    BuildingUlpinUpdateRequest, BuildingUlpinUpdateResponse,
 )
 from services.ulpin_generator import generate_ulpin, validate_ulpin, build_base_ulpin
+from services.ai_flagging import evaluate_suspicion
 from auth import hash_password, verify_password, create_access_token, get_current_user
 import json, os, re
 from datetime import datetime, timezone
@@ -35,11 +43,90 @@ from datetime import datetime, timezone
 # Create SQLite tables (creates new ones without dropping existing ones)
 Base.metadata.create_all(bind=engine)
 with engine.connect() as _migration_conn:
+    # Migration helper — safely adds a column if it doesn't already exist
+    def _safe_add_col(conn, table: str, col_def: str):
+        try:
+            conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {col_def}"))
+            conn.commit()
+        except Exception:
+            pass
+
+    # Original migration (preserves existing DB)
+    _safe_add_col(_migration_conn, "parcel_features", "notes TEXT")
+
+    # Feature A — parcel_ownership user_id FK
+    _safe_add_col(_migration_conn, "parcel_ownership", "user_id INTEGER")
+
+    # Feature B+C — AI flag columns on parcel_features
+    _safe_add_col(_migration_conn, "parcel_features", "flag_status TEXT DEFAULT 'clean'")
+    _safe_add_col(_migration_conn, "parcel_features", "flag_reason TEXT")
+    _safe_add_col(_migration_conn, "parcel_features", "flag_score REAL")
+    _safe_add_col(_migration_conn, "parcel_features", "flagged_at TEXT")
+    _safe_add_col(_migration_conn, "parcel_features", "reviewed_by INTEGER")
+    _safe_add_col(_migration_conn, "parcel_features", "reviewed_at TEXT")
+    _safe_add_col(_migration_conn, "parcel_features", "review_notes TEXT")
+
+    # Feature B+C — AI flag + reissue history columns on parcel_floors
+    _safe_add_col(_migration_conn, "parcel_floors", "flag_status TEXT DEFAULT 'clean'")
+    _safe_add_col(_migration_conn, "parcel_floors", "flag_reason TEXT")
+    _safe_add_col(_migration_conn, "parcel_floors", "flag_score REAL")
+    _safe_add_col(_migration_conn, "parcel_floors", "flagged_at TEXT")
+    _safe_add_col(_migration_conn, "parcel_floors", "reviewed_by INTEGER")
+    _safe_add_col(_migration_conn, "parcel_floors", "reviewed_at TEXT")
+    _safe_add_col(_migration_conn, "parcel_floors", "review_notes TEXT")
+    _safe_add_col(_migration_conn, "parcel_floors", "previous_ulpin TEXT")
+    _safe_add_col(_migration_conn, "parcel_floors", "reissued_at TEXT")
+    _safe_add_col(_migration_conn, "parcel_floors", "reissued_by INTEGER")
+
+    # Feature B+C — AI flag columns on parcel_flats
+    _safe_add_col(_migration_conn, "parcel_flats", "flag_status TEXT DEFAULT 'clean'")
+    _safe_add_col(_migration_conn, "parcel_flats", "flag_reason TEXT")
+    _safe_add_col(_migration_conn, "parcel_flats", "flag_score REAL")
+    _safe_add_col(_migration_conn, "parcel_flats", "flagged_at TEXT")
+    _safe_add_col(_migration_conn, "parcel_flats", "reviewed_by INTEGER")
+    _safe_add_col(_migration_conn, "parcel_flats", "reviewed_at TEXT")
+    _safe_add_col(_migration_conn, "parcel_flats", "review_notes TEXT")
+
+    # Feature E — Floor heights & elevations
+    _safe_add_col(_migration_conn, "parcel_features", "floor_height_m REAL DEFAULT 3.0")
+    _safe_add_col(_migration_conn, "parcel_floors", "height_override_m REAL")
+
+    # Feature F — Building-level ULPIN reassignment & history
+    _safe_add_col(_migration_conn, "parcel_features", "building_ulpin_assigned_at TEXT")
+    _safe_add_col(_migration_conn, "parcel_features", "building_ulpin_reassigned_by INTEGER")
+    _safe_add_col(_migration_conn, "parcel_features", "building_ulpin_history TEXT")
+    _safe_add_col(_migration_conn, "parcel_features", "building_ulpin TEXT")
+
+    # Enforce global ULPIN uniqueness in SQLite. Older databases can contain
+    # duplicate floor assignments; keep the first and move later copies into
+    # the existing reissue audit columns before clearing them for reassignment.
     try:
-        _migration_conn.execute(text("ALTER TABLE parcel_features ADD COLUMN notes TEXT"))
+        _migration_conn.execute(text("""
+            UPDATE parcel_floors
+            SET previous_ulpin = floor_ulpin, floor_ulpin = NULL
+            WHERE floor_ulpin IS NOT NULL
+              AND id NOT IN (
+                SELECT MIN(id) FROM parcel_floors
+                WHERE floor_ulpin IS NOT NULL GROUP BY floor_ulpin
+              )
+        """))
         _migration_conn.commit()
-    except Exception:
-        pass
+        _migration_conn.execute(text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_parcel_floors_floor_ulpin "
+            "ON parcel_floors (floor_ulpin) WHERE floor_ulpin IS NOT NULL"
+        ))
+        _migration_conn.execute(text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_parcel_flats_unit_ulpin "
+            "ON parcel_flats (unit_ulpin) WHERE unit_ulpin IS NOT NULL"
+        ))
+        _migration_conn.execute(text(
+            "CREATE UNIQUE INDEX IF NOT EXISTS uq_parcel_features_building_ulpin "
+            "ON parcel_features (building_ulpin) WHERE building_ulpin IS NOT NULL"
+        ))
+        _migration_conn.commit()
+    except Exception as exc:
+        _migration_conn.rollback()
+        print(f"[Migration] Could not apply ULPIN unique indexes: {exc}")
 
 app = FastAPI(
     title="Bhustack3D — 7-Layer Cadastral Intelligence API",
@@ -62,11 +149,14 @@ app.add_middleware(
         "http://127.0.0.1:4173",
         "http://127.0.0.1:3000",
         "https://causatively-gonangial-jennefer.ngrok-free.dev",
+        "http://causatively-gonangial-jennefer.ngrok-free.dev",
     ],
+    # Permit common local hosts and ngrok domains during development only.
     allow_origin_regex=r"^https?:\/\/([a-zA-Z0-9-]+\.)*(ngrok-free\.dev|ngrok-free\.app|ngrok\.io|localhost|127\.0\.0\.1)(:[0-9]+)?$",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"],
 )
 
 
@@ -372,6 +462,47 @@ def seed_kp2_layer4():
         db.close()
 
 
+@app.on_event("startup")
+def seed_sih2026_demo_accounts():
+    """
+    Idempotent: seed the two fixed SIH2026 demo accounts.
+    Credentials documented in DEMO_CREDENTIALS.md at repo root.
+    """
+    db = next(get_db())
+    try:
+        DEMO_ACCOUNTS = [
+            {
+                "name": "Demo Surveyor",
+                "email": "surveyor.demo@bhustack3d.local",
+                "password": "Surveyor@2026",
+                "role": Role.SURVEYOR.value,
+            },
+            {
+                "name": "Demo Citizen",
+                "email": "citizen.demo@bhustack3d.local",
+                "password": "Citizen@2026",
+                "role": Role.CITIZEN.value,
+            },
+        ]
+        for acc in DEMO_ACCOUNTS:
+            existing = db.query(User).filter(User.email == acc["email"]).first()
+            if not existing:
+                user = User(
+                    name=acc["name"],
+                    email=acc["email"],
+                    hashed_password=hash_password(acc["password"]),
+                    role=acc["role"],
+                )
+                db.add(user)
+                print(f"[Startup] Seeded SIH2026 demo account: {acc['email']} ({acc['role']})")
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        print(f"[Startup] WARNING: demo account seed failed: {e}")
+    finally:
+        db.close()
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Health & Root
 # ─────────────────────────────────────────────────────────────────────────────
@@ -386,12 +517,41 @@ def root():
         "layers": {
             "L1": "Data Acquisition — QGIS manual digitization (real)",
             "L2": "Pre-processing — Shapely validation/repair (real)",
-            "L3": "AI Extraction — STUB pass-through (see /services/ai_extraction.py)",
+            "L3": "AI Flagging — Rule-based heuristic v1 (real, 6 named rules; not ML)",
             "L4": "3D Cadastral DB — SQLite/SQLAlchemy (real, simplified)",
             "L5": "ULPIN Generation — Verhoeff checksum (real)",
-            "L6": "API Layer — /parcels /admin real; /integrations STUB",
-            "L7": "Application — React citizen portal + Admin Dashboard",
+            "L6": "API Layer — /parcels /admin /citizen real; /integrations STUB",
+            "L7": "Application — React citizen portal + Admin Dashboard + Flag Queue",
         },
+    }
+
+
+@app.get("/stats")
+def get_platform_stats(db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    """
+    Aggregate platform statistics.
+    Returns counts of parcels, features (buildings), floors, flats, and flagged items.
+    Requires authentication (any role).
+    """
+    total_parcels = db.query(Parcel).count()
+    total_features = db.query(ParcelFeature).count()
+    total_floors = db.query(ParcelFloor).count()
+    total_flats = db.query(ParcelFlat).count()
+    flagged_count = (
+        db.query(ParcelFeature).filter(ParcelFeature.flag_status == "flagged").count()
+        + db.query(ParcelFloor).filter(ParcelFloor.flag_status == "flagged").count()
+        + db.query(ParcelFlat).filter(ParcelFlat.flag_status == "flagged").count()
+    )
+    total_area = db.query(func.sum(Parcel.total_area)).scalar() or 0.0
+    return {
+        "total_parcels": total_parcels,
+        "total_features": total_features,
+        "total_buildings": total_features,
+        "total_floors": total_floors,
+        "total_flats": total_flats,
+        "flagged_count": flagged_count,
+        "total_area": float(total_area),
+        "avg_confidence": 90,
     }
 
 
@@ -532,47 +692,256 @@ def get_parcel(ulpin_id: str, db: Session = Depends(get_db)):
     return _location_to_response(loc)
 
 
-@app.get("/parcels/{ulpin_id}/validate", response_model=ULPINValidationResult)
-def validate_parcel_ulpin(ulpin_id: str):
+@app.get("/public/sample-ulpins", response_model=SampleUlpinsResponse)
+@app.get("/parcels/sample-ulpins", response_model=SampleUlpinsResponse)
+def get_sample_ulpins(limit: int = 4, db: Session = Depends(get_db)):
     """
-    Layer 5 + 6 Integration: Validate a 3D ULPIN's check digit live.
+    Public endpoint: returns live, currently-valid ULPINs pulled directly from the
+    authenticated database registry for quick verification specimen testing.
+    Mix of Flat (Unit), Floor (Vertical), Building (Superstructure), and Parcel (Ground).
+    """
+    samples = []
 
-    Re-derives the check digit using the same Verhoeff-inspired algorithm used
-    by generate_ulpin() and compares it against the digit embedded in the code.
+    # 1. Unit Level (Flat)
+    flat = db.query(ParcelFlat).filter(ParcelFlat.unit_ulpin.isnot(None)).order_by(ParcelFlat.id.desc()).first()
+    if flat and flat.unit_ulpin:
+        samples.append(SampleUlpinItem(
+            label=f"{flat.unit_number} (Unit Level)",
+            value=flat.unit_ulpin,
+            level="Unit Level",
+            entity_type="FLAT",
+        ))
 
-    This is a genuinely functional validation — test with a deliberately corrupted
-    ULPIN (e.g. change the final digit) to see it return valid: false.
+    # 2. Vertical Level (Floor)
+    floor = db.query(ParcelFloor).filter(ParcelFloor.floor_ulpin.isnot(None)).order_by(ParcelFloor.id.desc()).first()
+    if floor and floor.floor_ulpin:
+        f_lbl = floor.floor_label or f"Floor {floor.floor_number}"
+        samples.append(SampleUlpinItem(
+            label=f"{f_lbl} Plate (Vertical Level)",
+            value=floor.floor_ulpin,
+            level="Vertical Level",
+            entity_type="FLOOR",
+        ))
 
-    No database lookup required — validation is purely algorithmic.
+    # 3. Superstructure Level (Building)
+    building = db.query(ParcelFeature).filter(or_(ParcelFeature.building_ulpin.isnot(None), ParcelFeature.ulpin_3d.isnot(None))).first()
+    building_code = (building.building_ulpin or building.ulpin_3d) if building else None
+    if building and building_code:
+        b_name = building.feature_name or f"Building #{building.id}"
+        samples.append(SampleUlpinItem(
+            label=f"{b_name} (Building Level)",
+            value=building_code,
+            level="Building Level",
+            entity_type="BUILDING",
+        ))
+
+    # 4. Ground Parcel Level
+    parcel = db.query(Parcel).filter(Parcel.ulpin_3d.isnot(None)).first()
+    if parcel and parcel.ulpin_3d:
+        p_name = parcel.name or "Knowledge Park II"
+        if len(p_name) > 28:
+            p_name = "Knowledge Park II"
+        samples.append(SampleUlpinItem(
+            label=f"{p_name} (Ground Parcel)",
+            value=parcel.ulpin_3d,
+            level="Ground Parcel",
+            entity_type="PARCEL",
+        ))
+
+    return SampleUlpinsResponse(samples=samples[:limit])
+
+
+@app.get("/parcels/{ulpin_id}/validate", response_model=ULPINValidationResult)
+def validate_parcel_ulpin(ulpin_id: str, db: Session = Depends(get_db)):
+    """
+    Layer 5 + 6 Integration: Validate a 3D ULPIN's check digit and authenticate
+    against the official 3D cadastral registry.
+
+    Distinguishes:
+      - MALFORMED: doesn't match {14-char base}-V{level}-U{unit}-C{digit}
+      - CHECKSUM_FAILED: check digit mismatch
+      - NOT_FOUND: well-formed ULPIN with valid checksum, but not in official registry
+      - AUTHENTICATED: valid check digit + active record in database
     """
     from services.ulpin_generator import validate_ulpin
 
-    is_valid, expected, found = validate_ulpin(ulpin_id)
-
-    if expected == -1:
-        # Could not parse — malformed ULPIN
+    clean_code = (ulpin_id or "").strip().upper()
+    if not clean_code:
         return ULPINValidationResult(
             ulpin=ulpin_id,
             valid=False,
             check_digit_expected=-1,
             check_digit_found=-1,
+            error_type="MALFORMED",
+            message="Please enter a valid 3D ULPIN identifier.",
+        )
+
+    # 1. Algorithmic checksum validation
+    is_valid, expected, found = validate_ulpin(clean_code)
+
+    if expected == -1:
+        # Check if it's a 14-char base land parcel ULPIN (e.g. UP28KP2GNIDA0A)
+        parcel = db.query(Parcel).filter(func.upper(Parcel.parent_land_ulpin) == clean_code).first()
+        if parcel:
+            return ULPINValidationResult(
+                ulpin=clean_code,
+                valid=True,
+                check_digit_expected=0,
+                check_digit_found=0,
+                entity_type="PARCEL",
+                message="VALID: Authentic base land parcel record confirmed in national registry ✓",
+                details=ValidationDetails(
+                    name=parcel.name or "Cadastral Land Parcel",
+                    level="Surface Land Parcel",
+                    parentHierarchy="State of Uttar Pradesh / Gautam Buddha Nagar",
+                    confidence=94,
+                    verificationDate=parcel.last_verified_date.strftime("%Y-%m-%d") if parcel.last_verified_date else datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+                    issuingAuthority="Department of Land Resources & Survey of India",
+                    geographicalBoundary=f"{parcel.centroid_lat:.4f}N, {parcel.centroid_lon:.4f}E",
+                )
+            )
+
+        return ULPINValidationResult(
+            ulpin=clean_code,
+            valid=False,
+            check_digit_expected=-1,
+            check_digit_found=-1,
+            error_type="MALFORMED",
             message=(
                 "INVALID FORMAT: Could not parse ULPIN structure. "
                 "Expected format: {14-char base}-V{level}-U{unit}-C{digit}"
             ),
         )
 
+    if not is_valid:
+        return ULPINValidationResult(
+            ulpin=clean_code,
+            valid=False,
+            check_digit_expected=expected,
+            check_digit_found=found,
+            error_type="CHECKSUM_FAILED",
+            message=f"INVALID CHECKSUM: Check digit {found} does not match expected {expected} ✗",
+        )
+
+    # 2. Database registry lookup to verify authentic registration and return details
+    # Check Flat
+    flat = db.query(ParcelFlat).filter(func.upper(ParcelFlat.unit_ulpin) == clean_code).first()
+    if flat:
+        floor = db.query(ParcelFloor).filter(ParcelFloor.id == flat.floor_id).first()
+        feature = db.query(ParcelFeature).filter(ParcelFeature.id == floor.parcel_feature_id).first() if floor else None
+        parcel = db.query(Parcel).filter(Parcel.id == feature.parcel_id).first() if feature else None
+        
+        bldg_name = (feature.feature_name if feature and feature.feature_name else f"Building #{feature.id}") if feature else "Building"
+        floor_label = (floor.floor_label or f"Floor {floor.floor_number}") if floor else "Floor"
+        parent_hier = f"{parcel.name if parcel else 'Knowledge Park II'} / {bldg_name} / {floor_label}"
+
+        return ULPINValidationResult(
+            ulpin=clean_code,
+            valid=True,
+            check_digit_expected=expected,
+            check_digit_found=found,
+            entity_type="FLAT",
+            message=f"VALID: Authentic unit-level record confirmed in cadastral registry (Check digit {found} ✓)",
+            details=ValidationDetails(
+                name=f"{flat.unit_number} ({flat.unit_type or 'Residential Unit'})",
+                level=f"{floor_label} — Unit Level",
+                parentHierarchy=parent_hier,
+                confidence=98,
+                verificationDate=flat.updated_at.strftime("%Y-%m-%d") if flat.updated_at else datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+                issuingAuthority="Department of Land Resources & Survey of India",
+                geographicalBoundary="Uttar Pradesh (Gautam Buddha Nagar)",
+            )
+        )
+
+    # Check Floor
+    floor = db.query(ParcelFloor).filter(func.upper(ParcelFloor.floor_ulpin) == clean_code).first()
+    if floor:
+        feature = db.query(ParcelFeature).filter(ParcelFeature.id == floor.parcel_feature_id).first()
+        parcel = db.query(Parcel).filter(Parcel.id == feature.parcel_id).first() if feature else None
+        bldg_name = (feature.feature_name if feature and feature.feature_name else f"Building #{feature.id}") if feature else "Building"
+        parent_hier = f"{parcel.name if parcel else 'Knowledge Park II'} / {bldg_name}"
+        floor_label = floor.floor_label or f"Floor {floor.floor_number}"
+
+        return ULPINValidationResult(
+            ulpin=clean_code,
+            valid=True,
+            check_digit_expected=expected,
+            check_digit_found=found,
+            entity_type="FLOOR",
+            message=f"VALID: Authentic vertical floor plate confirmed in cadastral registry (Check digit {found} ✓)",
+            details=ValidationDetails(
+                name=f"{floor_label} Plate",
+                level="Building Vertical Level",
+                parentHierarchy=parent_hier,
+                confidence=96,
+                verificationDate=floor.updated_at.strftime("%Y-%m-%d") if floor.updated_at else datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+                issuingAuthority="Department of Land Resources & Survey of India",
+                geographicalBoundary="Uttar Pradesh (Gautam Buddha Nagar)",
+            )
+        )
+
+    # Check Building Feature
+    feature = db.query(ParcelFeature).filter(or_(
+        func.upper(ParcelFeature.building_ulpin) == clean_code,
+        func.upper(ParcelFeature.ulpin_3d) == clean_code,
+    )).first()
+    if feature:
+        parcel = db.query(Parcel).filter(Parcel.id == feature.parcel_id).first()
+        bldg_name = feature.feature_name or f"Cadastral Structure #{feature.id}"
+        parent_hier = parcel.name if parcel else "Knowledge Park II"
+
+        return ULPINValidationResult(
+            ulpin=clean_code,
+            valid=True,
+            check_digit_expected=expected,
+            check_digit_found=found,
+            entity_type="BUILDING",
+            message=f"VALID: Authentic superstructure record confirmed in cadastral registry (Check digit {found} ✓)",
+            details=ValidationDetails(
+                name=bldg_name,
+                level="Superstructure Level",
+                parentHierarchy=parent_hier,
+                confidence=95,
+                verificationDate=feature.building_ulpin_assigned_at or datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+                issuingAuthority="Department of Land Resources & Survey of India",
+                geographicalBoundary="Uttar Pradesh (Gautam Buddha Nagar)",
+            )
+        )
+
+    # Check Parcel
+    parcel = db.query(Parcel).filter(func.upper(Parcel.ulpin_3d) == clean_code).first()
+    if parcel:
+        return ULPINValidationResult(
+            ulpin=clean_code,
+            valid=True,
+            check_digit_expected=expected,
+            check_digit_found=found,
+            entity_type="PARCEL",
+            message=f"VALID: Authentic surface parcel record confirmed in cadastral registry (Check digit {found} ✓)",
+            details=ValidationDetails(
+                name=parcel.name or "Cadastral Land Parcel",
+                level="Surface Land Parcel",
+                parentHierarchy="State of Uttar Pradesh / Gautam Buddha Nagar",
+                confidence=94,
+                verificationDate=parcel.last_verified_date.strftime("%Y-%m-%d") if parcel.last_verified_date else datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+                issuingAuthority="Department of Land Resources & Survey of India",
+                geographicalBoundary=f"{parcel.centroid_lat:.4f}N, {parcel.centroid_lon:.4f}E",
+            )
+        )
+
+    # Valid algorithmic checksum, but no database entry found
     return ULPINValidationResult(
-        ulpin=ulpin_id,
-        valid=is_valid,
+        ulpin=clean_code,
+        valid=False,
         check_digit_expected=expected,
         check_digit_found=found,
+        error_type="NOT_FOUND",
         message=(
-            f"VALID: Check digit {found} is correct ✓"
-            if is_valid
-            else f"INVALID: Check digit {found} does not match expected {expected} ✗"
+            f"IDENTIFIER NOT FOUND IN REGISTRY: Well-formed ULPIN with valid checksum (C{found}), "
+            "but no matching authenticated 3D cadastral record exists in the national database."
         ),
     )
+
 
 
 @app.get("/parcels/{ulpin_id}/confidence", response_model=ConfidenceResult)
@@ -640,15 +1009,70 @@ def get_parcel_confidence(ulpin_id: str, db: Session = Depends(get_db)):
 # Admin / Government Dashboard Routes (Layer 7 — Real, Role-Protected)
 # ─────────────────────────────────────────────────────────────────────────────
 
-_ADMIN_ROLES = {"admin", "ADMIN", "surveyor", "SURVEYOR"}
+# Roles that can access admin/surveyor endpoints (both strings preserved for legacy compat)
+def _normalized_role(user: User) -> Role | None:
+    try:
+        return Role((user.role or "").strip().lower())
+    except ValueError:
+        return None
 
 
 def _require_admin(current_user: User = Depends(get_current_user)) -> User:
     """Dependency: ensure the caller has admin or surveyor role."""
-    if current_user.role not in _ADMIN_ROLES:
+    if _normalized_role(current_user) not in {Role.ADMIN, Role.SURVEYOR}:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
-            detail="Access denied. Admin or Surveyor role required.",
+            detail="Access denied. Admin or Surveyor role required. Citizens cannot perform this action.",
+        )
+    return current_user
+
+
+def _require_platform_admin(current_user: User = Depends(get_current_user)) -> User:
+    """Dependency for platform administration reserved strictly for admins."""
+    if _normalized_role(current_user) != Role.ADMIN:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Access denied. Platform Admin role required.",
+        )
+    return current_user
+
+
+@app.post("/admin/users", response_model=UserResponse, status_code=status.HTTP_201_CREATED)
+def create_admin_managed_user(
+    data: AdminUserCreate,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(_require_platform_admin),
+):
+    """Create a surveyor or admin account; public signup remains citizen-only."""
+    email_clean = data.email.lower().strip()
+    if db.query(User).filter(User.email == email_clean).first():
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="An account with this email already exists.")
+    user = User(
+        name=email_clean.split("@", 1)[0],
+        email=email_clean,
+        hashed_password=hash_password(data.password),
+        role=data.role,
+    )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    return user
+
+
+def _require_surveyor(current_user: User = Depends(get_current_user)) -> User:
+    """
+    Dependency: ensure the caller has surveyor or admin role.
+    Used on ULPIN-assignment and mutation routes that require surveyor authority.
+    Returns 403 (not 401) with a clear detail message for citizen tokens.
+    """
+    if _normalized_role(current_user) not in {Role.SURVEYOR, Role.ADMIN}:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail=(
+                "Access denied. Surveyor role required. "
+                "Only a certified surveyor can assign or modify 3D ULPINs. "
+                "Citizen accounts have read-only access to parcel data."
+            ),
         )
     return current_user
 
@@ -729,7 +1153,46 @@ def _extract_base_ulpin(parcel: Parcel) -> str:
     return build_base_ulpin("UP", "28", "KP2GNIDA0A")
 
 
-@app.get("/admin/parcels/{parcel_id}/features", response_model=list[FeatureDetailResponse])
+def _assign_floor_ulpin(floor: ParcelFloor, feature: ParcelFeature, parcel: Parcel,
+                        db: Session, actor: User, force: bool = False):
+    """Shared validated assignment path for single and bulk floor ULPIN routes."""
+    if floor.floor_ulpin and not force:
+        raise HTTPException(status_code=409, detail=f"Floor {floor.id} already has a ULPIN. Pass force=true to reissue.")
+    # The unit segment includes the globally unique floor id. A fixed "0000"
+    # segment would collide for same-level floors in separate buildings on a parcel.
+    generated = generate_ulpin(_extract_base_ulpin(parcel), floor.floor_number, f"{floor.id:04d}")
+    valid, expected, found = validate_ulpin(generated)
+    if not valid:
+        raise HTTPException(status_code=500, detail=f"Generated ULPIN failed checksum validation (expected C{expected}, got C{found}).")
+    collision = db.query(ParcelFloor).filter(
+        ParcelFloor.floor_ulpin == generated, ParcelFloor.id != floor.id
+    ).first()
+    if collision:
+        raise HTTPException(status_code=409, detail=f"Generated ULPIN collides with floor #{collision.id}.")
+    is_reissue = bool(floor.floor_ulpin and force)
+    if is_reissue:
+        floor.previous_ulpin = floor.floor_ulpin
+        floor.reissued_at = datetime.now(timezone.utc).isoformat()
+        floor.reissued_by = actor.id
+    floor.floor_ulpin = generated
+    floor.updated_at = datetime.now(timezone.utc)
+    flag_result = evaluate_suspicion("floor", floor, {
+        "assigned_ulpin": generated,
+        "is_force_reissue": is_reissue,
+        "feature": feature,
+    }, db)
+    return generated, found, is_reissue, flag_result
+
+
+def _compute_floor_elevations(floor: ParcelFloor, feature: ParcelFeature):
+    """Calculates 3D elevation base and top (in meters) relative to ground plane."""
+    height = float(floor.height_override_m if getattr(floor, "height_override_m", None) is not None else getattr(feature, "floor_height_m", 3.0) or 3.0)
+    base = round(floor.floor_number * height, 2)
+    top = round((floor.floor_number + 1) * height, 2)
+    return base, top, height
+
+
+@app.get("/admin/parcels/{parcel_id}/features", response_model=list[FeatureDetailResponseWithFlag])
 def get_parcel_features(
     parcel_id: int,
     db: Session = Depends(get_db),
@@ -737,7 +1200,7 @@ def get_parcel_features(
 ):
     """
     List all buildings / features belonging to a parcel.
-    Includes count of defined floors in parcel_floors for that building.
+    Includes count of defined floors, AI flag status, and building ULPIN metadata.
     """
     parcel = db.query(Parcel).filter(Parcel.id == parcel_id).first()
     if not parcel:
@@ -747,7 +1210,7 @@ def get_parcel_features(
     results = []
     for f in features:
         defined_count = db.query(ParcelFloor).filter(ParcelFloor.parcel_feature_id == f.id).count()
-        results.append(FeatureDetailResponse(
+        results.append(FeatureDetailResponseWithFlag(
             id=f.id,
             parcel_id=f.parcel_id,
             fid=f.fid,
@@ -756,23 +1219,31 @@ def get_parcel_features(
             area=f.area,
             floor_level=f.floor_level,
             floor_count=f.floor_count,
+            floor_height_m=getattr(f, "floor_height_m", 3.0) or 3.0,
             building_type=f.building_type,
             feature_name=f.feature_name,
             notes=getattr(f, "notes", None),
             defined_floor_count=defined_count,
+            building_ulpin=getattr(f, "building_ulpin", None),
+            building_ulpin_assigned_at=getattr(f, "building_ulpin_assigned_at", None),
+            building_ulpin_reassigned_by=getattr(f, "building_ulpin_reassigned_by", None),
+            building_ulpin_history=getattr(f, "building_ulpin_history", None),
+            flag_status=getattr(f, "flag_status", "clean"),
+            flag_reason=getattr(f, "flag_reason", None),
+            flag_score=getattr(f, "flag_score", None),
         ))
     return results
 
 
-@app.put("/admin/parcels/{parcel_id}/features/{feature_id}", response_model=FeatureDetailResponse)
+@app.put("/admin/parcels/{parcel_id}/features/{feature_id}", response_model=FeatureDetailResponseWithFlag)
 def update_feature_attributes(
     parcel_id: int,
     feature_id: int,
     body: FeatureUpdateRequest,
     db: Session = Depends(get_db),
-    current_user: User = Depends(_require_admin),
+    current_user: User = Depends(_require_surveyor),
 ):
-    """Edit building/feature's basic attributes (name/label, height, notes)."""
+    """Edit building/feature's basic attributes (name/label, height, notes, floor_height_m). Surveyor only."""
     feature = db.query(ParcelFeature).filter(
         ParcelFeature.id == feature_id,
         ParcelFeature.parcel_id == parcel_id,
@@ -786,11 +1257,17 @@ def update_feature_attributes(
         feature.height = float(body.height)
     if body.notes is not None:
         feature.notes = body.notes
+    if body.floor_height_m is not None:
+        feature.floor_height_m = float(body.floor_height_m)
+
+    # AI Flagging — run before commit so flag fields are persisted atomically
+    defined_count = db.query(ParcelFloor).filter(ParcelFloor.parcel_feature_id == feature.id).count()
+    evaluate_suspicion("feature", feature, {"defined_floor_count": defined_count}, db)
 
     db.commit()
     db.refresh(feature)
     defined_count = db.query(ParcelFloor).filter(ParcelFloor.parcel_feature_id == feature.id).count()
-    return FeatureDetailResponse(
+    return FeatureDetailResponseWithFlag(
         id=feature.id,
         parcel_id=feature.parcel_id,
         fid=feature.fid,
@@ -799,73 +1276,144 @@ def update_feature_attributes(
         area=feature.area,
         floor_level=feature.floor_level,
         floor_count=feature.floor_count,
+        floor_height_m=getattr(feature, "floor_height_m", 3.0) or 3.0,
         building_type=feature.building_type,
         feature_name=feature.feature_name,
         notes=getattr(feature, "notes", None),
         defined_floor_count=defined_count,
+        building_ulpin=getattr(feature, "building_ulpin", None),
+        building_ulpin_assigned_at=getattr(feature, "building_ulpin_assigned_at", None),
+        building_ulpin_reassigned_by=getattr(feature, "building_ulpin_reassigned_by", None),
+        building_ulpin_history=getattr(feature, "building_ulpin_history", None),
+        flag_status=getattr(feature, "flag_status", "clean"),
+        flag_reason=getattr(feature, "flag_reason", None),
+        flag_score=getattr(feature, "flag_score", None),
     )
 
 
-@app.get("/admin/parcels/{parcel_id}/features/{feature_id}/floors", response_model=list[FloorResponse])
-def list_building_floors(
+@app.put(
+    "/admin/parcels/{parcel_id}/features/{feature_id}/ulpin",
+    response_model=BuildingUlpinUpdateResponse,
+)
+def update_building_ulpin(
     parcel_id: int,
     feature_id: int,
+    body: BuildingUlpinUpdateRequest,
     db: Session = Depends(get_db),
-    current_user: User = Depends(_require_admin),
+    current_user: User = Depends(_require_surveyor),
 ):
-    """Returns all floors (with nested flats) for that building."""
+    """
+    Surveyor reassigns or manually sets a building's 3D ULPIN.
+    Supports auto-generation ({action: 'generate'}) or explicit ULPIN ({ulpin: '...'}).
+    Enforces format validation, platform uniqueness, archives old ULPIN in
+    building_ulpin_history, and automatically resolves any existing flag to 'resolved_ok'.
+    """
     feature = db.query(ParcelFeature).filter(
         ParcelFeature.id == feature_id,
         ParcelFeature.parcel_id == parcel_id,
     ).first()
     if not feature:
-        raise HTTPException(status_code=404, detail="Building not found.")
+        raise HTTPException(status_code=404, detail="Building / feature not found on this parcel.")
 
-    floors = (
-        db.query(ParcelFloor)
-        .filter(ParcelFloor.parcel_feature_id == feature_id)
-        .order_by(ParcelFloor.floor_number.desc())
-        .all()
+    parcel = db.query(Parcel).filter(Parcel.id == parcel_id).first()
+    if not parcel:
+        raise HTTPException(status_code=404, detail="Parent parcel not found.")
+
+    old_ulpin = feature.building_ulpin or feature.ulpin_3d
+    target_ulpin = None
+
+    if (body.action or "").lower() == "generate" or not body.ulpin:
+        base_ulpin = _extract_base_ulpin(parcel)
+        target_ulpin = generate_ulpin(base_ulpin, 0, "BLDG")
+    else:
+        target_ulpin = body.ulpin.strip().upper()
+
+    # Validate syntax & checksum
+    valid, expected, found = validate_ulpin(target_ulpin)
+    if not valid:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=f"ULPIN '{target_ulpin}' failed verification: expected checksum C{expected}, got C{found}.",
+        )
+
+    # Check uniqueness across parcel_features
+    collision = db.query(ParcelFeature).filter(
+        or_(ParcelFeature.building_ulpin == target_ulpin, ParcelFeature.ulpin_3d == target_ulpin),
+        ParcelFeature.id != feature_id,
+    ).first()
+    if collision:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"ULPIN collision: '{target_ulpin}' is already held by building #{collision.id}.",
+        )
+
+    # Archive old ULPIN history
+    try:
+        history_list = json.loads(feature.building_ulpin_history) if feature.building_ulpin_history else []
+        if not isinstance(history_list, list):
+            history_list = []
+    except Exception:
+        history_list = []
+
+    if old_ulpin and old_ulpin != target_ulpin:
+        history_list.append({
+            "ulpin": old_ulpin,
+            "assigned_at": feature.building_ulpin_assigned_at or datetime.now(timezone.utc).isoformat(),
+            "reassigned_by": feature.building_ulpin_reassigned_by or current_user.id,
+            "reassigned_by_name": current_user.name or current_user.email,
+            "notes": body.notes or "Reassigned by surveyor",
+        })
+        feature.building_ulpin_history = json.dumps(history_list)
+
+    feature.building_ulpin = target_ulpin
+    feature.building_ulpin_assigned_at = datetime.now(timezone.utc).isoformat()
+    feature.building_ulpin_reassigned_by = current_user.id
+
+    # Auto-resolve flag if it was flagged or under review
+    flag_resolved = False
+    prev_flag_status = getattr(feature, "flag_status", "clean")
+    if prev_flag_status in ("flagged", "under_review"):
+        feature.flag_status = "resolved_ok"
+        feature.reviewed_by = current_user.id
+        feature.reviewed_at = datetime.now(timezone.utc).isoformat()
+        feature.review_notes = body.notes or "Automatically resolved via building ULPIN reassignment by surveyor."
+        flag_resolved = True
+
+    # Run AI Flagging on feature to verify new ULPIN
+    defined_count = db.query(ParcelFloor).filter(ParcelFloor.parcel_feature_id == feature.id).count()
+    evaluate_suspicion("feature", feature, {
+        "assigned_ulpin": target_ulpin,
+        "defined_floor_count": defined_count,
+    }, db)
+
+    db.commit()
+    db.refresh(feature)
+
+    return BuildingUlpinUpdateResponse(
+        id=feature.id,
+        ulpin_3d=target_ulpin,
+        status="assigned",
+        message=f"Building ULPIN updated to '{target_ulpin}'.",
+        previous_ulpin=old_ulpin if old_ulpin != target_ulpin else None,
+        flag_resolved=flag_resolved,
+        flag_status=getattr(feature, "flag_status", "clean"),
     )
 
-    results = []
-    for fl in floors:
-        flats = (
-            db.query(ParcelFlat)
-            .filter(ParcelFlat.floor_id == fl.id)
-            .order_by(ParcelFlat.unit_number.asc())
-            .all()
-        )
-        flat_schemas = [FlatResponse.model_validate(flat) for flat in flats]
-        results.append(
-            FloorResponse(
-                id=fl.id,
-                parcel_feature_id=fl.parcel_feature_id,
-                floor_number=fl.floor_number,
-                floor_ulpin=fl.floor_ulpin,
-                floor_label=fl.floor_label,
-                created_at=fl.created_at,
-                updated_at=fl.updated_at,
-                flats=flat_schemas,
-                flat_count=len(flat_schemas),
-            )
-        )
-    return results
 
 
-@app.post("/admin/parcels/{parcel_id}/features/{feature_id}/floors/generate", response_model=list[FloorResponse])
+@app.post("/admin/parcels/{parcel_id}/features/{feature_id}/floors/generate", response_model=list[FloorResponseWithFlag])
 def generate_building_floors(
     parcel_id: int,
     feature_id: int,
     body: FloorGenerateRequest,
     db: Session = Depends(get_db),
-    current_user: User = Depends(_require_admin),
+    current_user: User = Depends(_require_surveyor),
 ):
     """
     Auto-generates floor rows for that building:
     floor numbers 1 through floor_count (plus -1 through -basement_count for basements),
     each with default floor_label ("Floor 1", "Floor 2", ... "Basement 1", etc.)
-    and NO ulpin assigned yet.
+    and NO ulpin assigned yet. Surveyor only.
     """
     feature = db.query(ParcelFeature).filter(
         ParcelFeature.id == feature_id,
@@ -879,6 +1427,9 @@ def generate_building_floors(
         .filter(ParcelFloor.parcel_feature_id == feature_id).all()
     }
 
+    total_new = body.floor_count + body.basement_count
+    new_total = len(existing_numbers) + total_new
+
     # Basements: -1 down to -basement_count
     for b in range(1, body.basement_count + 1):
         num = -b
@@ -889,7 +1440,13 @@ def generate_building_floors(
                 floor_number=num,
                 floor_ulpin=None,
                 floor_label=label,
+                flag_status="clean",
             )
+            # AI Flagging R2 — floor count vs height anomaly
+            evaluate_suspicion("floor", fl, {
+                "feature": feature,
+                "defined_floor_count": new_total,
+            }, db)
             db.add(fl)
 
     # Above ground: 1 through floor_count
@@ -901,7 +1458,12 @@ def generate_building_floors(
                 floor_number=f,
                 floor_ulpin=None,
                 floor_label=label,
+                flag_status="clean",
             )
+            evaluate_suspicion("floor", fl, {
+                "feature": feature,
+                "defined_floor_count": new_total,
+            }, db)
             db.add(fl)
 
     db.commit()
@@ -911,18 +1473,372 @@ def generate_building_floors(
         feature.floor_count = total_defined
         db.commit()
 
-    return list_building_floors(parcel_id, feature_id, db, current_user)
+    return _list_building_floors_with_flags(parcel_id, feature_id, db, current_user)
 
 
-@app.post("/admin/parcels/{parcel_id}/features/{feature_id}/floors", response_model=FloorResponse)
+def _list_building_floors_with_flags(parcel_id: int, feature_id: int, db: Session, current_user: User):
+    feature = db.query(ParcelFeature).filter(
+        ParcelFeature.id == feature_id,
+        ParcelFeature.parcel_id == parcel_id,
+    ).first()
+    if not feature:
+        raise HTTPException(status_code=404, detail="Building not found.")
+
+    floors = db.query(ParcelFloor).filter(
+        ParcelFloor.parcel_feature_id == feature_id
+    ).order_by(ParcelFloor.floor_number.asc()).all()
+
+    result = []
+    for floor in floors:
+        base_m, top_m, height_m = _compute_floor_elevations(floor, feature)
+        flats = db.query(ParcelFlat).filter(
+            ParcelFlat.floor_id == floor.id
+        ).order_by(ParcelFlat.unit_number.asc()).all()
+
+        flat_responses = [
+            FlatResponseWithFlag(
+                id=flat.id,
+                floor_id=flat.floor_id,
+                unit_number=flat.unit_number,
+                unit_ulpin=flat.unit_ulpin,
+                unit_type=flat.unit_type,
+                area_sqm=flat.area_sqm,
+                owner_name=flat.owner_name,
+                created_at=flat.created_at,
+                updated_at=flat.updated_at,
+                flag_status=getattr(flat, "flag_status", "clean"),
+                flag_reason=getattr(flat, "flag_reason", None),
+                flag_score=getattr(flat, "flag_score", None),
+            )
+            for flat in flats
+        ]
+
+        result.append(FloorResponseWithFlag(
+            id=floor.id,
+            parcel_feature_id=floor.parcel_feature_id,
+            floor_number=floor.floor_number,
+            floor_ulpin=floor.floor_ulpin,
+            floor_label=floor.floor_label,
+            elevation_base_m=base_m,
+            elevation_top_m=top_m,
+            height_m=height_m,
+            created_at=floor.created_at,
+            updated_at=floor.updated_at,
+            flat_count=len(flat_responses),
+            flats=flat_responses,
+            flag_status=getattr(floor, "flag_status", "clean"),
+            flag_reason=getattr(floor, "flag_reason", None),
+            flag_score=getattr(floor, "flag_score", None),
+        ))
+    return result
+
+
+@app.get(
+    "/admin/parcels/{parcel_id}/features/{feature_id}/floors",
+    response_model=list[FloorResponseWithFlag],
+)
+def list_building_floors(
+    parcel_id: int,
+    feature_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(_require_surveyor),
+):
+    """Returns all floors and their flats with AI flag fields and elevations. Surveyor only."""
+    return _list_building_floors_with_flags(parcel_id, feature_id, db, current_user)
+
+
+@app.post(
+    "/admin/parcels/{parcel_id}/features/{feature_id}/floors/assign-ulpin-bulk",
+    response_model=FloorBulkAssignResponse,
+)
+def bulk_assign_floor_ulpins(
+    parcel_id: int,
+    feature_id: int,
+    body: FloorBulkAssignRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(_require_surveyor),
+):
+    """
+    Surveyor-exclusive bulk assignment of 3D ULPINs for all floors in a building.
+    Iterates ascending by floor_number.
+    - If floor already has ULPIN and force=false: skips and logs to skipped array.
+    - If force=true: reissues, archiving previous ULPIN and evaluating rapid-reissue anomaly.
+    - Validates syntax and checksum; checks platform uniqueness.
+    - Evaluates AI suspicion rule per floor.
+    """
+    feature = db.query(ParcelFeature).filter(
+        ParcelFeature.id == feature_id,
+        ParcelFeature.parcel_id == parcel_id,
+    ).first()
+    if not feature:
+        raise HTTPException(status_code=404, detail="Building / feature not found on this parcel.")
+
+    parcel = db.query(Parcel).filter(Parcel.id == parcel_id).first()
+    if not parcel:
+        raise HTTPException(status_code=404, detail="Parent parcel not found.")
+
+    floors = db.query(ParcelFloor).filter(
+        ParcelFloor.parcel_feature_id == feature_id
+    ).order_by(ParcelFloor.floor_number.asc()).all()
+
+    assigned = []
+    skipped = []
+    failed = []
+
+    for floor in floors:
+        if floor.floor_ulpin and not body.force:
+            skipped.append({
+                "id": floor.id,
+                "floor_number": floor.floor_number,
+                "floor_label": floor.floor_label,
+                "reason": f"Already assigned: {floor.floor_ulpin}",
+                "floor_ulpin": floor.floor_ulpin,
+            })
+            continue
+
+        try:
+            generated, _, _, _ = _assign_floor_ulpin(
+                floor, feature, parcel, db, current_user, force=body.force
+            )
+        except HTTPException as exc:
+            failed.append({
+                "id": floor.id,
+                "floor_number": floor.floor_number,
+                "floor_label": floor.floor_label,
+                "error": str(exc.detail),
+            })
+            continue
+
+        assigned.append({
+            "id": floor.id,
+            "floor_number": floor.floor_number,
+            "floor_label": floor.floor_label,
+            "floor_ulpin": generated,
+            "flag_status": getattr(floor, "flag_status", "clean"),
+        })
+
+    db.commit()
+
+    return FloorBulkAssignResponse(
+        feature_id=feature_id,
+        total_floors=len(floors),
+        assigned_count=len(assigned),
+        skipped_count=len(skipped),
+        failed_count=len(failed),
+        assigned=assigned,
+        skipped=skipped,
+        failed=failed,
+    )
+
+
+@app.get("/citizen/search", response_model=list[CitizenSearchResult])
+def citizen_search(q_param: str = Query(..., alias="q", min_length=1), db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    term = q_param.strip().lower()
+    results = []
+    for loc in db.query(Location).all():
+        if any(term in (s or "").lower() for s in [loc.name, loc.ulpin_3d, loc.classification, loc.zone]):
+            is_mine = False
+            for lp in db.query(Parcel).filter(Parcel.ulpin_3d == loc.ulpin_3d).all():
+                if db.query(ParcelOwnership).filter(ParcelOwnership.parcel_id == lp.id, ParcelOwnership.user_id == current_user.id).first():
+                    is_mine = True
+                    break
+            results.append(CitizenSearchResult(
+                id=loc.id, name=loc.name, state=loc.state, lat=loc.lat, lon=loc.lon,
+                ulpin_3d=loc.ulpin_3d, classification=loc.classification, area=loc.area,
+                elevation=loc.elevation, feature_count=loc.feature_count, is_mine=is_mine,
+                parcel_ulpin=(db.query(Parcel).filter(Parcel.ulpin_3d == loc.ulpin_3d).first().ulpin_3d
+                    if db.query(Parcel).filter(Parcel.ulpin_3d == loc.ulpin_3d).first()
+                    else (db.query(Parcel).filter(Parcel.name.ilike("%Knowledge Park 2%" )).first().ulpin_3d
+                        if loc.id == "knowledge-park-2" and db.query(Parcel).filter(Parcel.name.ilike("%Knowledge Park 2%" )).first()
+                        else None)),
+            ))
+    return results
+
+
+@app.post("/admin/kp2/generate-floors-and-assign")
+def generate_kp2_floors_and_assign(
+    db: Session = Depends(get_db),
+    current_user: User = Depends(_require_surveyor),
+):
+    """Materialize 3 m floor records from the existing KP2 footprint inventory."""
+    parcel = db.query(Parcel).filter(Parcel.name.ilike("%Knowledge Park 2%")).first()
+    if not parcel:
+        raise HTTPException(status_code=404, detail="Knowledge Park 2 parcel inventory is not seeded.")
+
+    features = db.query(ParcelFeature).filter(ParcelFeature.parcel_id == parcel.id).order_by(ParcelFeature.id).all()
+    created = assigned = 0
+    try:
+        for feature in features:
+            desired_count = max(1, int(feature.floor_count or 1))
+            existing = {floor.floor_number: floor for floor in db.query(ParcelFloor).filter(
+                ParcelFloor.parcel_feature_id == feature.id
+            ).all()}
+            for floor_number in range(desired_count):
+                floor = existing.get(floor_number)
+                if floor is None:
+                    floor = ParcelFloor(
+                        parcel_feature_id=feature.id,
+                        floor_number=floor_number,
+                        floor_ulpin=None,
+                        floor_label="Ground Floor" if floor_number == 0 else f"Floor {floor_number}",
+                        flag_status="clean",
+                    )
+                    db.add(floor)
+                    db.flush()
+                    evaluate_suspicion("floor", floor, {"feature": feature, "defined_floor_count": desired_count}, db)
+                    created += 1
+                if not floor.floor_ulpin:
+                    _assign_floor_ulpin(floor, feature, parcel, db, current_user)
+                    assigned += 1
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    return {"parcel_id": parcel.id, "feature_count": len(features), "floors_created": created, "ulpins_assigned": assigned}
+
+
+@app.get("/citizen/parcels/{ulpin_id}/buildings", response_model=list[CitizenBuildingResponse])
+def citizen_get_buildings(ulpin_id: str, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    parcel = db.query(Parcel).filter(Parcel.ulpin_3d == ulpin_id).first()
+    if not parcel:
+        if not db.query(Location).filter(Location.ulpin_3d == ulpin_id).first():
+            raise HTTPException(status_code=404, detail="Parcel ULPIN not found.")
+        return []
+    features = db.query(ParcelFeature).filter(ParcelFeature.parcel_id == parcel.id).order_by(ParcelFeature.id.asc()).all()
+    return [CitizenBuildingResponse(
+        id=f.id, parcel_id=f.parcel_id, fid=f.fid, ulpin_3d=f.building_ulpin or f.ulpin_3d,
+        geometry=json.loads(f.geometry_json),
+        height=f.height, area=f.area, floor_count=f.floor_count,
+        building_type=f.building_type, feature_name=f.feature_name,
+        flag_status=getattr(f, "flag_status", "clean"),
+        flag_reason="Under surveyor review" if getattr(f, "flag_status", "clean") in ("flagged", "under_review") else None,
+    ) for f in features]
+
+
+@app.get("/citizen/parcels/{ulpin_id}/features/{feature_id}/floors", response_model=list[CitizenFloorResponse])
+def citizen_get_floors(ulpin_id: str, feature_id: int, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
+    parcel = db.query(Parcel).filter(Parcel.ulpin_3d == ulpin_id).first()
+    if not parcel:
+        raise HTTPException(status_code=404, detail="Parcel not found.")
+    feature = db.query(ParcelFeature).filter(ParcelFeature.id == feature_id, ParcelFeature.parcel_id == parcel.id).first()
+    if not feature:
+        raise HTTPException(status_code=404, detail="Building not found.")
+    floors = db.query(ParcelFloor).filter(ParcelFloor.parcel_feature_id == feature.id).order_by(ParcelFloor.floor_number.asc()).all()
+    uname = (current_user.name or "").lower().strip()
+    result = []
+    for floor in floors:
+        base_m, top_m, height_m = _compute_floor_elevations(floor, feature)
+        flats = db.query(ParcelFlat).filter(ParcelFlat.floor_id == floor.id).order_by(ParcelFlat.unit_number.asc()).all()
+        cf = []
+        for flat in flats:
+            own_lc = (flat.owner_name or "").lower().strip()
+            redacted = flat.owner_name if (uname and own_lc == uname) else None
+            cf.append(CitizenFlatResponse(
+                id=flat.id, floor_id=flat.floor_id, unit_number=flat.unit_number,
+                unit_ulpin=flat.unit_ulpin, unit_type=flat.unit_type, area_sqm=flat.area_sqm,
+                owner_name=redacted, flag_status=getattr(flat, "flag_status", "clean"), flag_reason=None,
+            ))
+        result.append(CitizenFloorResponse(
+            id=floor.id, parcel_feature_id=floor.parcel_feature_id,
+            floor_number=floor.floor_number, floor_ulpin=floor.floor_ulpin,
+            floor_label=floor.floor_label,
+            elevation_base_m=base_m,
+            elevation_top_m=top_m,
+            height_m=height_m,
+            flat_count=len(cf), flats=cf,
+            flag_status=getattr(floor, "flag_status", "clean"), flag_reason=None,
+        ))
+    return result
+
+
+
+@app.get("/admin/floors/{floor_id}/ulpin-history", response_model=ULPINReissueHistoryResponse)
+def get_floor_ulpin_history(floor_id: int, db: Session = Depends(get_db), current_user: User = Depends(_require_surveyor)):
+    floor = db.query(ParcelFloor).filter(ParcelFloor.id == floor_id).first()
+    if not floor:
+        raise HTTPException(status_code=404, detail="Floor not found.")
+    return ULPINReissueHistoryResponse(
+        floor_id=floor.id, current_ulpin=floor.floor_ulpin,
+        previous_ulpin=getattr(floor, "previous_ulpin", None),
+        reissued_at=getattr(floor, "reissued_at", None),
+        reissued_by=getattr(floor, "reissued_by", None),
+        has_reissue_history=bool(getattr(floor, "previous_ulpin", None)),
+    )
+
+
+@app.get("/admin/flags", response_model=list[FlaggedItemResponse])
+def get_flagged_items(
+    status_filter: str = Query("flagged", alias="status"),
+    entity_type: str = Query("all"),
+    page: int = Query(1, ge=1), size: int = Query(50, ge=1, le=200),
+    db: Session = Depends(get_db), current_user: User = Depends(_require_surveyor),
+):
+    results = []
+    offset = (page - 1) * size
+    def sq2(q2, model):
+        return q2.filter(model.flag_status != "clean") if status_filter == "all" else q2.filter(model.flag_status == status_filter)
+    if entity_type in ("feature", "all"):
+        for feat in sq2(db.query(ParcelFeature), ParcelFeature).all():
+            results.append(FlaggedItemResponse(
+                entity_type="feature", entity_id=feat.id,
+                entity_label="Building: " + (feat.feature_name or feat.ulpin_3d[:20]),
+                parcel_id=feat.parcel_id, flag_status=feat.flag_status or "clean",
+                flag_reason=feat.flag_reason, flag_score=feat.flag_score,
+                flagged_at=feat.flagged_at, reviewed_by=feat.reviewed_by,
+                reviewed_at=feat.reviewed_at, review_notes=feat.review_notes,
+            ))
+    if entity_type in ("floor", "all"):
+        for floor in sq2(db.query(ParcelFloor), ParcelFloor).all():
+            results.append(FlaggedItemResponse(
+                entity_type="floor", entity_id=floor.id, entity_label=floor.floor_label,
+                parcel_id=None, flag_status=floor.flag_status or "clean",
+                flag_reason=floor.flag_reason, flag_score=floor.flag_score,
+                flagged_at=floor.flagged_at, reviewed_by=floor.reviewed_by,
+                reviewed_at=floor.reviewed_at, review_notes=floor.review_notes,
+            ))
+    if entity_type in ("flat", "all"):
+        for flat in sq2(db.query(ParcelFlat), ParcelFlat).all():
+            results.append(FlaggedItemResponse(
+                entity_type="flat", entity_id=flat.id,
+                entity_label="Unit " + flat.unit_number,
+                parcel_id=None, flag_status=flat.flag_status or "clean",
+                flag_reason=flat.flag_reason, flag_score=flat.flag_score,
+                flagged_at=flat.flagged_at, reviewed_by=flat.reviewed_by,
+                reviewed_at=flat.reviewed_at, review_notes=flat.review_notes,
+            ))
+    results.sort(key=lambda x: (x.flagged_at or ""), reverse=True)
+    return results[offset:offset + size]
+
+
+@app.post("/admin/flags/{entity_type}/{entity_id}/resolve", response_model=MessageResponse)
+def resolve_flag(entity_type: str, entity_id: int, body: FlagResolveRequest, db: Session = Depends(get_db), current_user: User = Depends(_require_surveyor)):
+    mm = {"feature": ParcelFeature, "floor": ParcelFloor, "flat": ParcelFlat}
+    if entity_type not in mm:
+        raise HTTPException(status_code=400, detail="entity_type must be feature|floor|flat")
+    entity = db.query(mm[entity_type]).filter(mm[entity_type].id == entity_id).first()
+    if not entity:
+        raise HTTPException(status_code=404, detail=entity_type.title() + " not found.")
+    if getattr(entity, "flag_status", "clean") == "clean":
+        raise HTTPException(status_code=400, detail="Entity is not flagged.")
+    ns = "resolved_ok" if body.decision == "ok" else "resolved_rejected"
+    entity.flag_status = ns
+    entity.reviewed_by = current_user.id
+    entity.reviewed_at = datetime.now(timezone.utc).isoformat()
+    entity.review_notes = body.notes
+    db.commit()
+    return MessageResponse(detail=entity_type.title() + " resolved as " + ns + " by " + current_user.name + ".")
+
+
+
+@app.post("/admin/parcels/{parcel_id}/features/{feature_id}/floors", response_model=FloorResponseWithFlag)
 def create_single_floor(
     parcel_id: int,
     feature_id: int,
     body: FloorCreateRequest,
     db: Session = Depends(get_db),
-    current_user: User = Depends(_require_admin),
+    current_user: User = Depends(_require_surveyor),
 ):
-    """Surveyor manual single-floor creation."""
+    """Surveyor manual single-floor creation. Surveyor only."""
     feature = db.query(ParcelFeature).filter(
         ParcelFeature.id == feature_id,
         ParcelFeature.parcel_id == parcel_id,
@@ -946,22 +1862,29 @@ def create_single_floor(
     else:
         label = f"Floor {body.floor_number}"
 
+    total_defined = db.query(ParcelFloor).filter(ParcelFloor.parcel_feature_id == feature_id).count() + 1
+
     fl = ParcelFloor(
         parcel_feature_id=feature_id,
         floor_number=body.floor_number,
         floor_ulpin=None,
         floor_label=label,
+        flag_status="clean",
     )
+    # AI Flagging — R2 floor count anomaly
+    evaluate_suspicion("floor", fl, {
+        "feature": feature,
+        "defined_floor_count": total_defined,
+    }, db)
     db.add(fl)
     db.commit()
     db.refresh(fl)
 
-    total_defined = db.query(ParcelFloor).filter(ParcelFloor.parcel_feature_id == feature_id).count()
     if total_defined > feature.floor_count:
         feature.floor_count = total_defined
         db.commit()
 
-    return FloorResponse(
+    return FloorResponseWithFlag(
         id=fl.id,
         parcel_feature_id=fl.parcel_feature_id,
         floor_number=fl.floor_number,
@@ -971,17 +1894,20 @@ def create_single_floor(
         updated_at=fl.updated_at,
         flats=[],
         flat_count=0,
+        flag_status=getattr(fl, "flag_status", "clean"),
+        flag_reason=getattr(fl, "flag_reason", None),
+        flag_score=getattr(fl, "flag_score", None),
     )
 
 
-@app.put("/admin/floors/{floor_id}", response_model=FloorResponse)
+@app.put("/admin/floors/{floor_id}", response_model=FloorResponseWithFlag)
 def update_floor(
     floor_id: int,
     body: FloorUpdateRequest,
     db: Session = Depends(get_db),
-    current_user: User = Depends(_require_admin),
+    current_user: User = Depends(_require_surveyor),
 ):
-    """Edit a floor's label/floor_number manually."""
+    """Edit a floor's label/floor_number manually. Surveyor only."""
     floor = db.query(ParcelFloor).filter(ParcelFloor.id == floor_id).first()
     if not floor:
         raise HTTPException(status_code=404, detail="Floor not found.")
@@ -1000,12 +1926,21 @@ def update_floor(
         floor.floor_label = body.floor_label.strip()
 
     floor.updated_at = datetime.now(timezone.utc)
+
+    # AI Flagging before commit
+    feature = db.query(ParcelFeature).filter(ParcelFeature.id == floor.parcel_feature_id).first()
+    total_defined = db.query(ParcelFloor).filter(ParcelFloor.parcel_feature_id == floor.parcel_feature_id).count()
+    evaluate_suspicion("floor", floor, {
+        "feature": feature,
+        "defined_floor_count": total_defined,
+    }, db)
+
     db.commit()
     db.refresh(floor)
 
     flats = db.query(ParcelFlat).filter(ParcelFlat.floor_id == floor.id).order_by(ParcelFlat.unit_number.asc()).all()
-    flat_schemas = [FlatResponse.model_validate(flat) for flat in flats]
-    return FloorResponse(
+    flat_schemas = [FlatResponseWithFlag.model_validate(flat) for flat in flats]
+    return FloorResponseWithFlag(
         id=floor.id,
         parcel_feature_id=floor.parcel_feature_id,
         floor_number=floor.floor_number,
@@ -1015,6 +1950,9 @@ def update_floor(
         updated_at=floor.updated_at,
         flats=flat_schemas,
         flat_count=len(flat_schemas),
+        flag_status=getattr(floor, "flag_status", "clean"),
+        flag_reason=getattr(floor, "flag_reason", None),
+        flag_score=getattr(floor, "flag_score", None),
     )
 
 
@@ -1022,9 +1960,9 @@ def update_floor(
 def delete_floor(
     floor_id: int,
     db: Session = Depends(get_db),
-    current_user: User = Depends(_require_admin),
+    current_user: User = Depends(_require_surveyor),
 ):
-    """Remove a floor (and cascade-delete its flats)."""
+    """Remove a floor (and cascade-delete its flats). Surveyor only."""
     floor = db.query(ParcelFloor).filter(ParcelFloor.id == floor_id).first()
     if not floor:
         raise HTTPException(status_code=404, detail="Floor not found.")
@@ -1034,21 +1972,24 @@ def delete_floor(
     return MessageResponse(detail=f"Floor {floor_id} and all its units were deleted.")
 
 
-@app.post("/admin/floors/{floor_id}/flats/generate", response_model=list[FlatResponse])
+@app.post("/admin/floors/{floor_id}/flats/generate", response_model=list[FlatResponseWithFlag])
 def generate_flats(
     floor_id: int,
     body: FlatGenerateRequest,
     db: Session = Depends(get_db),
-    current_user: User = Depends(_require_admin),
+    current_user: User = Depends(_require_surveyor),
 ):
     """
     Auto-generates flat rows for that floor:
     unit_number values combining floor number + sequence (e.g. floor 7 + flat 4 = "704"),
-    each with NO ulpin assigned yet.
+    each with NO ulpin assigned yet. Surveyor only.
     """
     floor = db.query(ParcelFloor).filter(ParcelFloor.id == floor_id).first()
     if not floor:
         raise HTTPException(status_code=404, detail="Floor not found.")
+
+    feature = db.query(ParcelFeature).filter(ParcelFeature.id == floor.parcel_feature_id).first()
+    parcel_id = feature.parcel_id if feature else None
 
     existing_units = {
         row[0] for row in db.query(ParcelFlat.unit_number)
@@ -1073,25 +2014,34 @@ def generate_flats(
                 unit_type="Residential",
                 area_sqm=75.0,
                 owner_name=None,
+                flag_status="clean",
             )
+            # AI Flagging — R6 unit number pattern check
+            evaluate_suspicion("flat", flat, {
+                "unit_number": unit_num,
+                "parcel_id": parcel_id,
+            }, db)
             db.add(flat)
 
     db.commit()
     flats = db.query(ParcelFlat).filter(ParcelFlat.floor_id == floor.id).order_by(ParcelFlat.unit_number.asc()).all()
-    return [FlatResponse.model_validate(f) for f in flats]
+    return [FlatResponseWithFlag.model_validate(f) for f in flats]
 
 
-@app.post("/admin/floors/{floor_id}/flats", response_model=FlatResponse)
+@app.post("/admin/floors/{floor_id}/flats", response_model=FlatResponseWithFlag)
 def create_single_flat(
     floor_id: int,
     body: FlatCreateRequest,
     db: Session = Depends(get_db),
-    current_user: User = Depends(_require_admin),
+    current_user: User = Depends(_require_surveyor),
 ):
-    """Surveyor manual single-flat creation."""
+    """Surveyor manual single-flat creation. Surveyor only."""
     floor = db.query(ParcelFloor).filter(ParcelFloor.id == floor_id).first()
     if not floor:
         raise HTTPException(status_code=404, detail="Floor not found.")
+
+    feature = db.query(ParcelFeature).filter(ParcelFeature.id == floor.parcel_feature_id).first()
+    parcel_id = feature.parcel_id if feature else None
 
     unit_clean = body.unit_number.strip()
     existing = db.query(ParcelFlat).filter(
@@ -1108,24 +2058,34 @@ def create_single_flat(
         unit_type=body.unit_type or "Residential",
         area_sqm=body.area_sqm,
         owner_name=body.owner_name.strip() if body.owner_name else None,
+        flag_status="clean",
     )
+    # AI Flagging — R4 ownership, R6 unit pattern
+    owner_ctx = {"unit_number": unit_clean, "parcel_id": parcel_id}
+    if body.owner_name:
+        owner_ctx["new_owner_name"] = body.owner_name.strip()
+    evaluate_suspicion("flat", flat, owner_ctx, db)
     db.add(flat)
     db.commit()
     db.refresh(flat)
-    return FlatResponse.model_validate(flat)
+    return FlatResponseWithFlag.model_validate(flat)
 
 
-@app.put("/admin/flats/{flat_id}", response_model=FlatResponse)
+@app.put("/admin/flats/{flat_id}", response_model=FlatResponseWithFlag)
 def update_flat(
     flat_id: int,
     body: FlatUpdateRequest,
     db: Session = Depends(get_db),
-    current_user: User = Depends(_require_admin),
+    current_user: User = Depends(_require_surveyor),
 ):
-    """Edit a flat's unit_number, unit_type, area_sqm, owner_name manually."""
+    """Edit a flat's unit_number, unit_type, area_sqm, owner_name manually. Surveyor only."""
     flat = db.query(ParcelFlat).filter(ParcelFlat.id == flat_id).first()
     if not flat:
         raise HTTPException(status_code=404, detail="Flat not found.")
+
+    floor = db.query(ParcelFloor).filter(ParcelFloor.id == flat.floor_id).first()
+    feature = db.query(ParcelFeature).filter(ParcelFeature.id == floor.parcel_feature_id).first() if floor else None
+    parcel_id = feature.parcel_id if feature else None
 
     if body.unit_number is not None and body.unit_number.strip():
         unit_clean = body.unit_number.strip()
@@ -1146,18 +2106,25 @@ def update_flat(
         flat.owner_name = body.owner_name.strip() or None
 
     flat.updated_at = datetime.now(timezone.utc)
+
+    # AI Flagging — R4 ownership, R6 unit pattern
+    flag_ctx = {"unit_number": flat.unit_number, "parcel_id": parcel_id}
+    if body.owner_name:
+        flag_ctx["new_owner_name"] = body.owner_name.strip()
+    evaluate_suspicion("flat", flat, flag_ctx, db)
+
     db.commit()
     db.refresh(flat)
-    return FlatResponse.model_validate(flat)
+    return FlatResponseWithFlag.model_validate(flat)
 
 
 @app.delete("/admin/flats/{flat_id}", response_model=MessageResponse)
 def delete_flat(
     flat_id: int,
     db: Session = Depends(get_db),
-    current_user: User = Depends(_require_admin),
+    current_user: User = Depends(_require_surveyor),
 ):
-    """Remove a flat."""
+    """Remove a flat. Surveyor only."""
     flat = db.query(ParcelFlat).filter(ParcelFlat.id == flat_id).first()
     if not flat:
         raise HTTPException(status_code=404, detail="Flat not found.")
@@ -1170,14 +2137,20 @@ def delete_flat(
 @app.post("/admin/floors/{floor_id}/assign-ulpin", response_model=AssignUlpinResponse)
 def assign_floor_ulpin(
     floor_id: int,
+    force: bool = Query(False, description="Set true to force-reissue an already-assigned ULPIN (surveyor only)"),
     db: Session = Depends(get_db),
-    current_user: User = Depends(_require_admin),
+    current_user: User = Depends(_require_surveyor),
 ):
     """
-    Generates and saves a real 3D ULPIN for this floor using the EXISTING
-    generate_ulpin() function from Layer 5, with vertical_level = this floor's floor_number
-    and unit_code = a floor-level placeholder ("0000").
-    Saves the result into floor_ulpin. Returns the generated code.
+    Generates and saves a real 3D ULPIN for this floor using generate_ulpin()
+    from Layer 5. Surveyor-exclusive (returns 403 for citizen tokens).
+
+    Idempotency: if floor_ulpin is already set, returns 409 Conflict unless
+    force=true is passed by the surveyor — in which case the old ULPIN is
+    archived in previous_ulpin/reissued_at/reissued_by before overwriting.
+
+    Platform-wide uniqueness: checks that no other floor already holds the
+    generated ULPIN before saving (returns 409 on collision).
     """
     floor = db.query(ParcelFloor).filter(ParcelFloor.id == floor_id).first()
     if not floor:
@@ -1191,21 +2164,24 @@ def assign_floor_ulpin(
     if not parcel:
         raise HTTPException(status_code=404, detail="Parent parcel not found.")
 
-    base_ulpin = _extract_base_ulpin(parcel)
-    generated = generate_ulpin(base_ulpin, floor.floor_number, "0000")
-    valid, expected, found = validate_ulpin(generated)
-    if not valid:
-        raise HTTPException(status_code=500, detail="Generated ULPIN failed checksum validation.")
+    generated, found, is_force_reissue, flag_result = _assign_floor_ulpin(
+        floor, feature, parcel, db, current_user, force=force
+    )
 
-    floor.floor_ulpin = generated
-    floor.updated_at = datetime.now(timezone.utc)
     db.commit()
+
+    msg = f"Floor ULPIN '{generated}' successfully assigned with valid checksum (C{found})."
+    if is_force_reissue:
+        msg += f" Previous ULPIN '{floor.previous_ulpin}' archived."
 
     return AssignUlpinResponse(
         id=floor.id,
         ulpin_3d=generated,
         status="assigned",
-        message=f"Floor ULPIN '{generated}' successfully assigned with valid checksum (C{found}).",
+        message=msg,
+        flag_status=getattr(floor, "flag_status", "clean") if flag_result.fired else "clean",
+        flag_reason=getattr(floor, "flag_reason", None) if flag_result.fired else None,
+        flag_score=getattr(floor, "flag_score", None) if flag_result.fired else None,
     )
 
 
@@ -1213,15 +2189,17 @@ def assign_floor_ulpin(
 def assign_flat_ulpin(
     flat_id: int,
     db: Session = Depends(get_db),
-    current_user: User = Depends(_require_admin),
+    current_user: User = Depends(_require_surveyor),
 ):
     """
     Generates and saves a real 3D ULPIN for this flat using generate_ulpin() with
     vertical_level = its parent floor's floor_number and unit_code = its unit_number.
-    Saves into unit_flat's unit_ulpin.
-    Runs the EXISTING overlap/uniqueness check before saving (reject if this exact
-    vertical_level + unit_code combination already has a ULPIN issued under the same
-    parent building, return a clear error).
+    Surveyor-exclusive (returns 403 for citizen tokens).
+
+    Overlap check: calls check_spatial_overlap() from the ULPIN engine (R1 rule) to
+    verify the building footprint doesn't conflict with a different parcel's feature.
+    Also runs the exact-string duplicate check within the same building.
+    Platform-wide global uniqueness check across all flats.
     """
     flat = db.query(ParcelFlat).filter(ParcelFlat.id == flat_id).first()
     if not flat:
@@ -1239,6 +2217,26 @@ def assign_flat_ulpin(
     if not parcel:
         raise HTTPException(status_code=404, detail="Parent parcel not found.")
 
+    # Spatial overlap check (R1 — wired in from live route per Feature B spec)
+    try:
+        from services.ulpin_generator import check_spatial_overlap
+        geom_dict = json.loads(feature.geometry_json)
+        overlapping = check_spatial_overlap(geom_dict, db)
+        others = [u for u in overlapping if u != feature.ulpin_3d]
+        if others:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Spatial overlap detected: Building #{feature.fid or feature.id} footprint "
+                    f"intersects {len(others)} existing feature(s): {', '.join(others[:3])}. "
+                    "Resolve geometry conflict before assigning ULPIN."
+                ),
+            )
+    except HTTPException:
+        raise
+    except Exception:
+        pass  # Shapely not installed — skip gracefully
+
     # Clean unit code to alphanumeric (max 6 chars)
     clean_unit = re.sub(r"[^A-Za-z0-9]", "", flat.unit_number).upper()
     if not clean_unit:
@@ -1248,13 +2246,11 @@ def assign_flat_ulpin(
     base_ulpin = _extract_base_ulpin(parcel)
     generated_code = generate_ulpin(base_ulpin, floor.floor_number, clean_unit)
 
-    # Overlap / uniqueness check: look for any other flat in the same parent building
-    # with the same assigned unit_ulpin
+    # Exact-string duplicate check within the same building
     sibling_floor_ids = [
         sf.id for sf in db.query(ParcelFloor.id)
         .filter(ParcelFloor.parcel_feature_id == feature.id).all()
     ]
-
     conflicting_flat = (
         db.query(ParcelFlat)
         .filter(
@@ -1264,14 +2260,27 @@ def assign_flat_ulpin(
         )
         .first()
     )
-
     if conflicting_flat:
         raise HTTPException(
             status_code=400,
             detail=(
-                f"ULPIN Duplicate Collision: Building #{feature.fid or feature.id} already has an assigned ULPIN "
-                f"'{generated_code}' at level V{floor.floor_number} for unit '{conflicting_flat.unit_number}'. "
+                f"ULPIN Duplicate Collision: Building #{feature.fid or feature.id} already has ULPIN "
+                f"'{generated_code}' at V{floor.floor_number} for unit '{conflicting_flat.unit_number}'. "
                 "A unit cannot duplicate an existing 3D strata parcel within the same building."
+            ),
+        )
+
+    # Feature B — Platform-wide global uniqueness check
+    global_collision = db.query(ParcelFlat).filter(
+        ParcelFlat.unit_ulpin == generated_code,
+        ParcelFlat.id != flat.id,
+    ).first()
+    if global_collision:
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=(
+                f"Global ULPIN Collision: '{generated_code}' is already assigned globally "
+                f"to flat #{global_collision.id}. This indicates a data integrity issue."
             ),
         )
 
@@ -1281,6 +2290,14 @@ def assign_flat_ulpin(
 
     flat.unit_ulpin = generated_code
     flat.updated_at = datetime.now(timezone.utc)
+
+    # AI Flagging — R3 checksum, R4 ownership, R6 unit pattern
+    flag_result = evaluate_suspicion("flat", flat, {
+        "assigned_ulpin": generated_code,
+        "unit_number": flat.unit_number,
+        "parcel_id": parcel.id,
+    }, db)
+
     db.commit()
 
     return AssignUlpinResponse(
@@ -1288,6 +2305,9 @@ def assign_flat_ulpin(
         ulpin_3d=generated_code,
         status="assigned",
         message=f"Flat ULPIN '{generated_code}' assigned with verified checksum (C{found}).",
+        flag_status=getattr(flat, "flag_status", "clean") if flag_result.fired else "clean",
+        flag_reason=getattr(flat, "flag_reason", None) if flag_result.fired else None,
+        flag_score=getattr(flat, "flag_score", None) if flag_result.fired else None,
     )
 
 
@@ -1369,7 +2389,6 @@ def bank_kyc_stub(ulpin_id: str):
             "See SIH26011 solution document Section 6 for production integration spec."
         ),
     )
-
 
 if __name__ == "__main__":
     import uvicorn

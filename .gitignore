@@ -1,0 +1,11 @@
+# Local model checkpoints are large, machine-specific artifacts.
+*.pt
+*.pth
+*.ckpt
+
+# Local environment and generated application artifacts.
+.env
+**/__pycache__/
+**/node_modules/
+**/dist/
+*.log

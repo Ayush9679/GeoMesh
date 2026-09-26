@@ -1,4 +1,4 @@
-# Bhustack3D — 7-Layer Architecture Documentation
+﻿# Bhustack3D — 7-Layer Architecture Documentation
 
 ## Overview
 
@@ -37,19 +37,22 @@ production.
 
 ---
 
-## Layer 3 — AI/ML Extraction Engine
+## Layer 3 — AI Flagging Engine
 
 | Item | Prototype | Production |
 |------|-----------|------------|
-| Building footprint segmentation | **STUB** — pass-through of pre-digitized QGIS data | U-Net / Segment Anything Model (SAM) fine-tuned on Indian cadastral imagery |
-| Floor count estimation | **STUB** — est_height / 3m heuristic | Shadow-length analysis, LiDAR DSM-DTM difference |
-| Input | Pre-digitized GeoJSON | Raw satellite raster tiles |
-| Output | Same features passed through | GeoJSON FeatureCollection with confidence scores |
+| Suspicion checks | **Real (rule-based heuristic v1)** — named checks for geometry overlap, floor/height mismatch, ULPIN checksum, ownership mismatch, rapid reissue, and unit-number pattern |
+| Model type | Deterministic rules; **not machine learning** | Calibrated models supported by verified training data |
+| Input | Feature, floor, flat, and mutation context | Same, plus independently verified reference data |
+| Output | Synchronous flag status, reason, score, and review metadata | Auditable risk estimates with human review |
 
-> **STUB** — clearly labeled. The pipeline shape is preserved so the real model
-> can be swapped in by replacing `extract_footprints()` internals.
+> Layer 3 is a heuristic decision-support engine, not a trained AI model. A
+> separate SAM imagery-to-footprint pipeline is not yet integrated into the API.
+> The local SAM 3 checkpoint is expected at the repository root as `sam3.pt`
+> (or at a future `SAM3_CHECKPOINT_PATH` override). It is excluded from Git;
+> no current API route loads it.
 
-**Files:** `services/ai_extraction.py`
+**Files:** `services/ai_flagging.py`; `services/ai_extraction.py` remains a seed-script helper.
 
 ---
 

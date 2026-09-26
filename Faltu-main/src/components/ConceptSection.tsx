@@ -1,4 +1,4 @@
-import { useState } from 'react';
+﻿import { useState } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
   Layers,
@@ -86,7 +86,7 @@ const COMPARISONS = [
   {
     limitation: 'Flat 2D Cadastre (Current)',
     problem: 'Single owner per plot coordinate; apartment units and subsurface metro tunnels clash on the same parcel ID.',
-    solution: 'Bhustack3D Volumetric ULPIN',
+    solution: 'GeoMesh Volumetric ULPIN',
     resolved: 'True 3D bounding prisms (X, Y, Z + elevation bounds) allowing thousands of distinct legal titles per coordinate pin.',
   },
   {
@@ -154,7 +154,7 @@ export default function ConceptSection() {
             transition={{ duration: 0.5, delay: 0.2 }}
             className="font-body text-base sm:text-lg text-slate-300 leading-relaxed"
           >
-            Traditional land cadastres only capture flat, 2D surface boundaries. Bhustack3D extends
+            Traditional land cadastres only capture flat, 2D surface boundaries. GeoMesh extends
             India&apos;s 14-digit ULPIN into the volumetric dimension — enabling legally distinct,
             tamper-proof ownership for multi-storey apartments, underground infrastructure, and air
             rights.

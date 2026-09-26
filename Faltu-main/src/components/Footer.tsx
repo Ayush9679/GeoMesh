@@ -1,4 +1,4 @@
-import { motion } from 'framer-motion';
+﻿import { motion } from 'framer-motion';
 import { Github, Twitter, Linkedin, Mail } from 'lucide-react';
 import Logo from './Logo';
 
@@ -74,7 +74,7 @@ export default function Footer() {
         {/* Bottom bar */}
         <div className="pt-8 border-t border-white/5 flex flex-col sm:flex-row items-center justify-between gap-4">
           <p className="text-xs font-body text-slate-600">
-            © 2026 Bhustack3D. All rights reserved.
+            © 2026 GeoMesh. All rights reserved.
           </p>
           <div className="flex items-center gap-2 text-xs font-body text-slate-600">
             <span className="w-1.5 h-1.5 rounded-full bg-success-400 animate-pulse" />

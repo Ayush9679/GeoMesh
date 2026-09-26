@@ -1,4 +1,4 @@
-/**
+﻿/**
  * AdminDashboard.tsx — Layer 7: Government / Admin Dashboard
  *
  * Route: /admin (protected — admin or SURVEYOR role only)
@@ -27,6 +27,7 @@ import { AdminRoute } from './admin/types';
 import BuildingsView from './admin/BuildingsView';
 import FloorsView from './admin/FloorsView';
 import FlatsView from './admin/FlatsView';
+import FlaggedReviewQueue from './admin/FlaggedReviewQueue';
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -105,6 +106,7 @@ export default function AdminDashboard() {
   const navigate = useNavigate();
 
   const [route, setRoute] = useState<AdminRoute>({ level: 1 });
+  const [activeTab, setActiveTab] = useState<'parcels' | 'flags'>('parcels');
   const [parcels, setParcels] = useState<ParcelRowState[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -254,7 +256,7 @@ export default function AdminDashboard() {
             </div>
             <h1 style={styles.title}>3D Cadastral Registry</h1>
             <p style={styles.subtitle}>
-              Bhustack3D · SIH26011 · Knowledge Park 2, Greater Noida
+              GeoMesh · SIH26011 · Knowledge Park 2, Greater Noida
             </p>
           </div>
         </div>
@@ -287,38 +289,104 @@ export default function AdminDashboard() {
         </span>
       </div>
 
-      {/* LEVELS 2–4 — Surveyor drill-down */}
-      {route.level === 2 && token && (
-        <BuildingsView
-          token={token}
-          parcel={route.parcel}
-          onBack={backToParcels}
-          onSelectFeature={(feat) => setRoute({ level: 3, parcel: route.parcel, feature: feat })}
-        />
+      {/* Main Admin Tab Bar */}
+      <div style={{ display: 'flex', gap: 12, borderBottom: '1px solid rgba(255, 255, 255, 0.08)', paddingBottom: 14, marginBottom: 20 }}>
+        <button
+          id="tab-parcels"
+          type="button"
+          onClick={() => { setActiveTab('parcels'); }}
+          style={{
+            background: activeTab === 'parcels' ? 'rgba(56, 189, 248, 0.15)' : 'rgba(255, 255, 255, 0.03)',
+            color: activeTab === 'parcels' ? '#38bdf8' : '#94a3b8',
+            border: activeTab === 'parcels' ? '1px solid rgba(56, 189, 248, 0.4)' : '1px solid rgba(255, 255, 255, 0.08)',
+            borderRadius: 8,
+            padding: '9px 18px',
+            fontSize: 13,
+            fontWeight: 600,
+            cursor: 'pointer',
+            display: 'flex',
+            alignItems: 'center',
+            gap: 8,
+            transition: 'all 0.15s ease',
+          }}
+        >
+          <span>🏛 Cadastral Registry</span>
+        </button>
+
+        <button
+          id="tab-flags"
+          type="button"
+          onClick={() => { setActiveTab('flags'); }}
+          style={{
+            background: activeTab === 'flags' ? 'rgba(239, 68, 68, 0.15)' : 'rgba(255, 255, 255, 0.03)',
+            color: activeTab === 'flags' ? '#f87171' : '#94a3b8',
+            border: activeTab === 'flags' ? '1px solid rgba(239, 68, 68, 0.4)' : '1px solid rgba(255, 255, 255, 0.08)',
+            borderRadius: 8,
+            padding: '9px 18px',
+            fontSize: 13,
+            fontWeight: 600,
+            cursor: 'pointer',
+            display: 'flex',
+            alignItems: 'center',
+            gap: 8,
+            transition: 'all 0.15s ease',
+          }}
+        >
+          <span>⚠ AI Flag Queue</span>
+          <span style={{
+            background: activeTab === 'flags' ? 'rgba(239, 68, 68, 0.3)' : 'rgba(239, 68, 68, 0.15)',
+            color: '#fca5a5',
+            fontSize: 10,
+            fontWeight: 700,
+            borderRadius: 999,
+            padding: '2px 7px',
+            fontFamily: 'monospace',
+          }}>
+            L3 Heuristic
+          </span>
+        </button>
+      </div>
+
+      {/* Flag Queue View */}
+      {activeTab === 'flags' && token && (
+        <FlaggedReviewQueue token={token} />
       )}
 
-      {route.level === 3 && token && (
-        <FloorsView
-          token={token}
-          parcel={route.parcel}
-          feature={route.feature}
-          onBack={() => setRoute({ level: 2, parcel: route.parcel })}
-          onSelectFloor={(floor) => setRoute({ level: 4, parcel: route.parcel, feature: route.feature, floor })}
-        />
-      )}
+      {/* Cadastral Registry View (Levels 1–4) */}
+      {activeTab === 'parcels' && (
+        <>
+          {/* LEVELS 2–4 — Surveyor drill-down */}
+          {route.level === 2 && token && (
+            <BuildingsView
+              token={token}
+              parcel={route.parcel}
+              onBack={backToParcels}
+              onSelectFeature={(feat) => setRoute({ level: 3, parcel: route.parcel, feature: feat })}
+            />
+          )}
 
-      {route.level === 4 && token && (
-        <FlatsView
-          token={token}
-          parcel={route.parcel}
-          feature={route.feature}
-          floor={route.floor}
-          onBack={() => setRoute({ level: 3, parcel: route.parcel, feature: route.feature })}
-        />
-      )}
+          {route.level === 3 && token && (
+            <FloorsView
+              token={token}
+              parcel={route.parcel}
+              feature={route.feature}
+              onBack={() => setRoute({ level: 2, parcel: route.parcel })}
+              onSelectFloor={(floor) => setRoute({ level: 4, parcel: route.parcel, feature: route.feature, floor })}
+            />
+          )}
 
-      {/* LEVEL 1 — Parcel list */}
-      {route.level === 1 && (
+          {route.level === 4 && token && (
+            <FlatsView
+              token={token}
+              parcel={route.parcel}
+              feature={route.feature}
+              floor={route.floor}
+              onBack={() => setRoute({ level: 3, parcel: route.parcel, feature: route.feature })}
+            />
+          )}
+
+          {/* LEVEL 1 — Parcel list */}
+          {route.level === 1 && (
         <>
           {/* Search */}
           <div style={styles.searchRow}>
@@ -527,6 +595,8 @@ export default function AdminDashboard() {
               Blockchain hash-anchoring · Municipal system integrations.
             </div>
           </div>
+        </>
+      )}
         </>
       )}
     </div>

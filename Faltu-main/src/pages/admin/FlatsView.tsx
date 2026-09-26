@@ -202,7 +202,13 @@ export default function FlatsView({
         const next = [...prev];
         next[idx] = {
           ...next[idx],
-          row: { ...next[idx].row, unit_ulpin: res.ulpin_3d },
+          row: {
+            ...next[idx].row,
+            unit_ulpin: res.ulpin_3d,
+            flag_status: res.flag_status || next[idx].row.flag_status,
+            flag_reason: res.flag_reason || next[idx].row.flag_reason,
+            flag_score: res.flag_score ?? next[idx].row.flag_score,
+          },
           assignState: 'assigned',
           assignMessage: res.message,
         };
@@ -431,6 +437,26 @@ export default function FlatsView({
                         <Badge variant={assigned ? 'success' : 'warning'} dot={assigned ? '#34d399' : '#fbbf24'}>
                           {assigned ? 'Assigned' : 'Not assigned'}
                         </Badge>
+                        {r.row.flag_status === 'flagged' && (
+                          <span
+                            title={`Flagged by AI Engine: ${r.row.flag_reason || 'Anomaly detected'}`}
+                            style={{ display: 'inline-flex', cursor: 'help' }}
+                          >
+                            <Badge variant="danger" dot="#ef4444">
+                              ⚠ Flagged: {r.row.flag_reason || 'Suspicious'}
+                            </Badge>
+                          </span>
+                        )}
+                        {r.row.flag_status === 'resolved_ok' && (
+                          <Badge variant="success" dot="#10b981">
+                            ✓ Verified Clean
+                          </Badge>
+                        )}
+                        {r.row.flag_status === 'resolved_rejected' && (
+                          <Badge variant="danger" dot="#ef4444">
+                            ✕ Flagged (Rejected)
+                          </Badge>
+                        )}
                       </div>
                       {assigned && (
                         <div style={{ marginTop: 6 }}>

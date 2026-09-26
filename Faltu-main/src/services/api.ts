@@ -110,10 +110,17 @@ export interface FeatureDetailResponse {
   area: number | null;
   floor_level: number;
   floor_count: number;
+  floor_height_m?: number;
   building_type: string | null;
   feature_name: string | null;
   notes: string | null;
   defined_floor_count: number;
+  building_ulpin_assigned_at?: string | null;
+  building_ulpin_reassigned_by?: number | null;
+  building_ulpin_history?: string | null;
+  flag_status?: string | null;
+  flag_reason?: string | null;
+  flag_score?: number | null;
 }
 
 /** Body for PUT /admin/parcels/{parcel_id}/features/{feature_id}. */
@@ -121,6 +128,7 @@ export interface FeatureUpdateRequest {
   name?: string | null;
   height?: number | null;
   notes?: string | null;
+  floor_height_m?: number | null;
 }
 
 /** A flat / unit row in parcel_flats. */
@@ -134,6 +142,9 @@ export interface FlatResponse {
   owner_name: string | null;
   created_at: string;
   updated_at: string;
+  flag_status?: string | null;
+  flag_reason?: string | null;
+  flag_score?: number | null;
 }
 
 /** A floor row in parcel_floors, with nested flats. */
@@ -143,10 +154,17 @@ export interface FloorResponse {
   floor_number: number;
   floor_ulpin: string | null;
   floor_label: string;
+  elevation_base_m?: number;
+  elevation_top_m?: number;
+  height_m?: number;
+  height_override_m?: number | null;
   created_at: string;
   updated_at: string;
   flats: FlatResponse[];
   flat_count: number;
+  flag_status?: string | null;
+  flag_reason?: string | null;
+  flag_score?: number | null;
 }
 
 /** Body for POST .../floors/generate. */
@@ -195,10 +213,145 @@ export interface AssignUlpinResponse {
   ulpin_3d: string;
   status: string;
   message: string;
+  flag_status?: string | null;
+  flag_reason?: string | null;
+  flag_score?: number | null;
 }
 
 export interface MessageResponse {
   detail: string;
+}
+
+// ── Citizen & Flagged Review Schemas ─────────────────────────────────────────
+
+export interface CitizenSearchResult {
+  id: string;
+  name: string;
+  state: string;
+  lat: number;
+  lon: number;
+  ulpin_3d: string;
+  classification: string;
+  area: string;
+  elevation: string;
+  feature_count?: number | null;
+  is_mine: boolean;
+}
+
+export interface CitizenBuildingResponse {
+  id: number;
+  parcel_id: number;
+  fid: number | null;
+  ulpin_3d: string;
+  height: number | null;
+  area: number | null;
+  floor_count: number;
+  building_type: string | null;
+  feature_name: string | null;
+  flag_status?: string | null;
+  flag_reason?: string | null;
+}
+
+export interface CitizenFlatResponse {
+  id: number;
+  floor_id: number;
+  unit_number: string;
+  unit_ulpin: string | null;
+  unit_type: string;
+  area_sqm: number | null;
+  owner_name: string | null;
+  flag_status?: string | null;
+  flag_reason?: string | null;
+}
+
+export interface CitizenFloorResponse {
+  id: number;
+  parcel_feature_id: number;
+  floor_number: number;
+  floor_ulpin: string | null;
+  floor_label: string;
+  elevation_base_m?: number;
+  elevation_top_m?: number;
+  height_m?: number;
+  flat_count: number;
+  flats: CitizenFlatResponse[];
+  flag_status?: string | null;
+  flag_reason?: string | null;
+}
+
+export interface FlagResolveRequest {
+  decision: 'ok' | 'rejected';
+  notes?: string | null;
+}
+
+export interface FlaggedItemResponse {
+  entity_type: 'feature' | 'floor' | 'flat' | string;
+  entity_id: number;
+  entity_label: string;
+  parcel_id?: number | null;
+  flag_status: string;
+  flag_reason?: string | null;
+  flag_score?: number | null;
+  flagged_at?: string | null;
+  reviewed_by?: number | null;
+  reviewed_at?: string | null;
+  review_notes?: string | null;
+}
+
+export interface ULPINReissueHistoryResponse {
+  floor_id: number;
+  current_ulpin: string | null;
+  previous_ulpin: string | null;
+  reissued_at: string | null;
+  reissued_by: number | null;
+  has_reissue_history: boolean;
+}
+
+// ── Bulk Floor & Building ULPIN Reassignment Schemas ───────────────────────
+
+export interface BulkFloorItem {
+  id: number;
+  floor_number: number;
+  floor_label: string;
+  floor_ulpin?: string;
+  flag_status?: string;
+  reason?: string;
+  error?: string;
+}
+
+export interface FloorBulkAssignResponse {
+  feature_id: number;
+  total_floors: number;
+  assigned_count: number;
+  skipped_count: number;
+  failed_count: number;
+  assigned: BulkFloorItem[];
+  skipped: BulkFloorItem[];
+  failed: BulkFloorItem[];
+}
+
+export interface BuildingUlpinHistoryEntry {
+  ulpin: string;
+  assigned_at: string;
+  reassigned_by?: number;
+  reassigned_by_name?: string;
+  notes?: string;
+}
+
+export interface BuildingUlpinUpdateRequest {
+  ulpin?: string;
+  action?: 'set' | 'generate';
+  notes?: string;
+}
+
+export interface BuildingUlpinUpdateResponse {
+  id: number;
+  ulpin_3d: string;
+  status: string;
+  message: string;
+  previous_ulpin?: string | null;
+  flag_resolved: boolean;
+  flag_status: string;
 }
 
 /**
@@ -354,7 +507,7 @@ export const api = {
     return handleResponse<FeatureDetailResponse[]>(res);
   },
 
-  /** Edit a building's basic attributes (name, height, notes). */
+  /** Edit a building's basic attributes (name, height, notes, floor_height_m). */
   async updateFeature(
     token: string,
     parcelId: number,
@@ -367,6 +520,21 @@ export const api = {
       body: JSON.stringify(body),
     });
     return handleResponse<FeatureDetailResponse>(res);
+  },
+
+  /** Surveyor reassigns or manually sets building-level 3D ULPIN. Auto-resolves flags. */
+  async updateBuildingUlpin(
+    token: string,
+    parcelId: number,
+    featureId: number,
+    body: BuildingUlpinUpdateRequest
+  ): Promise<BuildingUlpinUpdateResponse> {
+    const res = await fetch(`${API_BASE_URL}/admin/parcels/${parcelId}/features/${featureId}/ulpin`, {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+      body: JSON.stringify(body),
+    });
+    return handleResponse<BuildingUlpinUpdateResponse>(res);
   },
 
   // ── Surveyor Drill-Down: Floors ────────────────────────────────────────
@@ -435,13 +603,43 @@ export const api = {
     return handleResponse<MessageResponse>(res);
   },
 
-  /** Generate and persist a real 3D ULPIN for this floor (Layer 5). */
-  async assignFloorUlpin(token: string, floorId: number): Promise<AssignUlpinResponse> {
-    const res = await fetch(`${API_BASE_URL}/admin/floors/${floorId}/assign-ulpin`, {
+  /** Generate and persist a real 3D ULPIN for this floor (Layer 5). Pass force=true to reissue. */
+  async assignFloorUlpin(token: string, floorId: number, force: boolean = false): Promise<AssignUlpinResponse> {
+    const url = `${API_BASE_URL}/admin/floors/${floorId}/assign-ulpin${force ? '?force=true' : ''}`;
+    const res = await fetch(url, {
       method: 'POST',
       headers: { Authorization: `Bearer ${token}` },
     });
     return handleResponse<AssignUlpinResponse>(res);
+  },
+
+  /** Surveyor-exclusive bulk assignment of 3D ULPINs for all floors in a building. */
+  async assignFloorsBulk(
+    token: string,
+    parcelId: number,
+    featureId: number,
+    force: boolean = false
+  ): Promise<FloorBulkAssignResponse> {
+    const res = await fetch(
+      `${API_BASE_URL}/admin/parcels/${parcelId}/features/${featureId}/floors/assign-ulpin-bulk`,
+      {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ force }),
+      }
+    );
+    return handleResponse<FloorBulkAssignResponse>(res);
+  },
+
+  /** Fetch ULPIN reissue and audit history for a floor. */
+  async getFloorUlpinHistory(token: string, floorId: number): Promise<ULPINReissueHistoryResponse> {
+    const res = await fetch(`${API_BASE_URL}/admin/floors/${floorId}/ulpin-history`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    return handleResponse<ULPINReissueHistoryResponse>(res);
   },
 
   // ── Surveyor Drill-Down: Flats ─────────────────────────────────────────
@@ -512,5 +710,69 @@ export const api = {
   async getBankKycStub(ulpin: string): Promise<BankKYCStub> {
     const res = await fetch(`${API_BASE_URL}/integrations/bank-kyc/${encodeURIComponent(ulpin)}`);
     return handleResponse<BankKYCStub>(res);
+  },
+
+  // ── Citizen Endpoints (Feature A) ─────────────────────────────────────────
+
+  /** Citizen parcel search with is_mine ownership detection. */
+  async citizenSearch(token: string, q: string): Promise<CitizenSearchResult[]> {
+    const res = await fetch(`${API_BASE_URL}/citizen/search?q=${encodeURIComponent(q)}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    return handleResponse<CitizenSearchResult[]>(res);
+  },
+
+  /** Citizen drill-down: fetch buildings/footprints for a parcel. */
+  async getCitizenBuildings(token: string, ulpinId: string): Promise<CitizenBuildingResponse[]> {
+    const res = await fetch(`${API_BASE_URL}/citizen/parcels/${encodeURIComponent(ulpinId)}/buildings`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    return handleResponse<CitizenBuildingResponse[]>(res);
+  },
+
+  /** Citizen drill-down: fetch floors and flats (with redacted ownership). */
+  async getCitizenFloors(token: string, ulpinId: string, featureId: number): Promise<CitizenFloorResponse[]> {
+    const res = await fetch(`${API_BASE_URL}/citizen/parcels/${encodeURIComponent(ulpinId)}/features/${featureId}/floors`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    return handleResponse<CitizenFloorResponse[]>(res);
+  },
+
+  // ── AI Flag Review Queue (Feature C) ──────────────────────────────────────
+
+  /** Surveyor / Admin review queue: fetch AI flagged cadastral entities. */
+  async getFlags(
+    token: string,
+    params?: { status?: string; entity_type?: string; page?: number; size?: number },
+  ): Promise<FlaggedItemResponse[]> {
+    const sp = new URLSearchParams();
+    if (params?.status) sp.set('status', params.status);
+    if (params?.entity_type) sp.set('entity_type', params.entity_type);
+    if (params?.page) sp.set('page', String(params.page));
+    if (params?.size) sp.set('size', String(params.size));
+    const qs = sp.toString();
+    const url = `${API_BASE_URL}/admin/flags${qs ? `?${qs}` : ''}`;
+    const res = await fetch(url, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    return handleResponse<FlaggedItemResponse[]>(res);
+  },
+
+  /** Surveyor / Admin: resolve, approve, or dismiss an AI flag. */
+  async resolveFlag(
+    token: string,
+    entityType: string,
+    entityId: number,
+    body: FlagResolveRequest,
+  ): Promise<MessageResponse> {
+    const res = await fetch(`${API_BASE_URL}/admin/flags/${encodeURIComponent(entityType)}/${entityId}/resolve`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${token}`,
+      },
+      body: JSON.stringify(body),
+    });
+    return handleResponse<MessageResponse>(res);
   },
 };

@@ -1,4 +1,4 @@
-import { motion } from 'framer-motion';
+﻿import { motion } from 'framer-motion';
 
 interface IndiaFocusProps {
   sectionProgress: number;
@@ -51,7 +51,7 @@ export default function IndiaFocus({ sectionProgress: _sectionProgress }: IndiaF
               transition={{ duration: 0.6, delay: 0.2 }}
               className="font-body text-base sm:text-lg text-slate-300 mb-4 leading-relaxed max-w-lg mx-auto lg:mx-0"
             >
-              From the Himalayan peaks to the coastal plains — Bhustack3D layers
+              From the Himalayan peaks to the coastal plains — GeoMesh layers
               cadastral records, satellite imagery, and terrain data across all
               28 states and 8 union territories.
             </motion.p>

@@ -1,0 +1,6 @@
+﻿{
+  "name": "GeoMesh",
+  "description": "3D Cadastral Intelligence Platform — India's land and property infrastructure visualized in three dimensions.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

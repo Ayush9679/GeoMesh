@@ -1,0 +1,107 @@
+@import "tailwindcss";
+
+@layer base {
+  :root {
+    --bg-primary: #050914;
+    --bg-secondary: #0A1324;
+    --bg-surface: #101E36;
+    --bg-elevated: #162847;
+    --border-color: #1E3557;
+    --accent-primary: #10B981;
+    --accent-secondary: #06B6D4;
+    --accent-glow: rgba(16, 185, 129, 0.35);
+    --text-primary: #F0FDF4;
+    --text-muted: #94A3B8;
+  }
+
+  body {
+    background-color: var(--bg-primary);
+    color: var(--text-primary);
+    font-family: 'Manrope', system-ui, -apple-system, sans-serif;
+    transition: background-color 0.25s ease, color 0.25s ease;
+  }
+
+  code, pre, .font-mono {
+    font-family: 'JetBrains Mono', monospace;
+  }
+}
+
+/* Dynamic CSS Theme overrides so existing UI seamlessly shifts with the active theme */
+.bg-\[\#071426\] {
+  background-color: var(--bg-primary) !important;
+}
+.bg-\[\#0B1F33\] {
+  background-color: var(--bg-secondary) !important;
+}
+.bg-\[\#10253D\] {
+  background-color: var(--bg-surface) !important;
+}
+.bg-\[\#142D48\] {
+  background-color: var(--bg-elevated) !important;
+}
+.border-\[\#243B53\] {
+  border-color: var(--border-color) !important;
+}
+.text-\[\#38BDF8\] {
+  color: var(--accent-primary) !important;
+}
+.border-\[\#38BDF8\] {
+  border-color: var(--accent-primary) !important;
+}
+.bg-\[\#38BDF8\] {
+  background-color: var(--accent-primary) !important;
+}
+.text-\[\#60A5FA\] {
+  color: var(--accent-secondary) !important;
+}
+.border-\[\#60A5FA\] {
+  border-color: var(--accent-secondary) !important;
+}
+.text-\[\#F8FAFC\] {
+  color: var(--text-primary) !important;
+}
+.text-\[\#94A3B8\] {
+  color: var(--text-muted) !important;
+}
+
+/* Custom GIS scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: var(--bg-primary);
+}
+::-webkit-scrollbar-thumb {
+  background: var(--border-color);
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--accent-primary);
+}
+
+/* Subtle grid backgrounds */
+.gis-grid {
+  background-size: 32px 32px;
+  background-image: 
+    linear-gradient(to right, rgba(36, 59, 83, 0.25) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(36, 59, 83, 0.25) 1px, transparent 1px);
+}
+
+.gis-grid-dense {
+  background-size: 16px 16px;
+  background-image: 
+    linear-gradient(to right, rgba(36, 59, 83, 0.35) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(36, 59, 83, 0.35) 1px, transparent 1px);
+}
+
+/* Scanner line keyframe */
+@keyframes scanline {
+  0% { transform: translateY(-100%); opacity: 0; }
+  50% { opacity: 0.6; }
+  100% { transform: translateY(1000%); opacity: 0; }
+}
+
+.animate-scan {
+  animation: scanline 4s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+}

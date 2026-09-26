@@ -12,7 +12,7 @@ Covers:
 """
 
 from datetime import datetime
-from typing import List, Optional, Any
+from typing import List, Optional, Any, Literal
 from pydantic import BaseModel, EmailStr, Field
 
 
@@ -27,8 +27,14 @@ class UserSignup(BaseModel):
 
 
 class UserLogin(BaseModel):
-    email: EmailStr = Field(..., description="Registered email address")
+    email: str = Field(..., min_length=3, description="Registered email address")
     password: str = Field(..., min_length=1, description="Password")
+
+
+class AdminUserCreate(BaseModel):
+    email: EmailStr
+    password: str = Field(..., min_length=6, max_length=128)
+    role: Literal["surveyor", "admin"]
 
 
 class UserResponse(BaseModel):
@@ -169,6 +175,16 @@ class AdminParcelRow(BaseModel):
 # Layer 5: ULPIN Validation Schema
 # ─────────────────────────────────────────────────────────────────────────────
 
+class ValidationDetails(BaseModel):
+    name: str
+    level: str
+    parentHierarchy: str
+    confidence: int
+    verificationDate: str
+    issuingAuthority: str
+    geographicalBoundary: str
+
+
 class ULPINValidationResult(BaseModel):
     """
     Response from GET /parcels/{ulpin_id}/validate.
@@ -179,6 +195,20 @@ class ULPINValidationResult(BaseModel):
     check_digit_expected: int       # The check digit our algorithm computes
     check_digit_found: int          # The check digit embedded in the submitted ULPIN
     message: str                    # Human-readable verdict
+    entity_type: Optional[str] = None
+    details: Optional[ValidationDetails] = None
+    error_type: Optional[str] = None
+
+
+class SampleUlpinItem(BaseModel):
+    label: str
+    value: str
+    level: str
+    entity_type: str
+
+
+class SampleUlpinsResponse(BaseModel):
+    samples: List[SampleUlpinItem]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -240,6 +270,7 @@ class FeatureUpdateRequest(BaseModel):
     name: Optional[str] = None
     height: Optional[float] = None
     notes: Optional[str] = None
+    floor_height_m: Optional[float] = None
 
 
 class FeatureDetailResponse(BaseModel):
@@ -251,10 +282,15 @@ class FeatureDetailResponse(BaseModel):
     area: Optional[float] = None
     floor_level: int
     floor_count: int
+    floor_height_m: float = 3.0
     building_type: Optional[str] = None
     feature_name: Optional[str] = None
     notes: Optional[str] = None
     defined_floor_count: int = 0
+    building_ulpin: Optional[str] = None
+    building_ulpin_assigned_at: Optional[str] = None
+    building_ulpin_reassigned_by: Optional[int] = None
+    building_ulpin_history: Optional[str] = None
 
     class Config:
         from_attributes = True
@@ -315,6 +351,9 @@ class FloorResponse(BaseModel):
     floor_number: int
     floor_ulpin: Optional[str] = None
     floor_label: str
+    elevation_base_m: float = 0.0
+    elevation_top_m: float = 3.0
+    height_m: float = 3.0
     created_at: datetime
     updated_at: datetime
     flats: List[FlatResponse] = []
@@ -329,4 +368,255 @@ class AssignUlpinResponse(BaseModel):
     ulpin_3d: str
     status: str = "assigned"
     message: str
+    flag_status: Optional[str] = None
+    flag_reason: Optional[str] = None
+    flag_score: Optional[float] = None
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Citizen-Facing Schemas (Feature A — read-only, authenticated)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class CitizenSearchResult(BaseModel):
+    """
+    Lightweight search result for /citizen/search — extends LocationSearchResult
+    with is_mine flag indicating if this parcel is linked to the caller's account.
+    """
+    id: str
+    name: str
+    state: str
+    lat: float
+    lon: float
+    ulpin_3d: str
+    parcel_ulpin: Optional[str] = None
+    classification: str
+    area: str
+    elevation: str
+    feature_count: Optional[int] = None
+    is_mine: bool = False   # True if any parcel_ownership row links to this user
+
+    class Config:
+        from_attributes = True
+
+
+class CitizenBuildingResponse(BaseModel):
+    """
+    Building (ParcelFeature) response for /citizen/parcels/{ulpin}/buildings.
+    Exposes only public-safe fields + flag_status for transparency.
+    """
+    id: int
+    parcel_id: int
+    fid: Optional[int] = None
+    ulpin_3d: str
+    geometry: dict
+    height: Optional[float] = None
+    area: Optional[float] = None
+    floor_count: int
+    building_type: Optional[str] = None
+    feature_name: Optional[str] = None
+    # AI flagging — transparent to citizens (cadastral transparency principle)
+    flag_status: Optional[str] = "clean"
+    flag_reason: Optional[str] = None   # Only populated if flagged; internal rule names not exposed
+
+    class Config:
+        from_attributes = True
+
+
+class CitizenFlatResponse(BaseModel):
+    """
+    Flat response for citizen endpoint — owner_name is redacted to null
+    unless the flat owner matches the requesting user's name.
+    """
+    id: int
+    floor_id: int
+    unit_number: str
+    unit_ulpin: Optional[str] = None
+    unit_type: str
+    area_sqm: Optional[float] = None
+    owner_name: Optional[str] = None   # Redacted if not matching the citizen's own name
+    flag_status: Optional[str] = "clean"
+    flag_reason: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+class CitizenFloorResponse(BaseModel):
+    """
+    Floor response for /citizen/.../floors — read-only, with flag badges and elevations.
+    """
+    id: int
+    parcel_feature_id: int
+    floor_number: int
+    floor_ulpin: Optional[str] = None
+    floor_label: str
+    elevation_base_m: float = 0.0
+    elevation_top_m: float = 3.0
+    height_m: float = 3.0
+    flat_count: int = 0
+    flats: List[CitizenFlatResponse] = []
+    flag_status: Optional[str] = "clean"
+    flag_reason: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# AI Flag / Review Schemas (Features B + C)
+# ─────────────────────────────────────────────────────────────────────────────
+
+class FlagResolveRequest(BaseModel):
+    """
+    Body for POST /admin/flags/{entity_type}/{entity_id}/resolve.
+    decision: "ok" → resolved_ok; "rejected" → resolved_rejected
+    """
+    decision: str = Field(..., pattern="^(ok|rejected)$", description="ok or rejected")
+    notes: Optional[str] = Field(None, description="Surveyor's resolution notes")
+
+
+class FlaggedItemResponse(BaseModel):
+    """
+    A single flagged entity in the review queue.
+    Returned by GET /admin/flags — polymorphic (feature | floor | flat).
+    """
+    entity_type: str           # "feature" | "floor" | "flat"
+    entity_id: int
+    entity_label: str          # Human-readable identifier (e.g. "Floor 3 of Building #12")
+    parcel_id: Optional[int] = None
+    flag_status: str
+    flag_reason: Optional[str] = None
+    flag_score: Optional[float] = None
+    flagged_at: Optional[str] = None
+    reviewed_by: Optional[int] = None
+    reviewed_at: Optional[str] = None
+    review_notes: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+class ULPINReissueHistoryResponse(BaseModel):
+    """
+    Response from GET /admin/floors/{floor_id}/ulpin-history.
+    Documents the force-reissue audit trail for a floor ULPIN.
+    """
+    floor_id: int
+    current_ulpin: Optional[str] = None
+    previous_ulpin: Optional[str] = None
+    reissued_at: Optional[str] = None
+    reissued_by: Optional[int] = None
+    has_reissue_history: bool = False
+
+    class Config:
+        from_attributes = True
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Updated Floor/Flat response schemas with flag fields
+# ─────────────────────────────────────────────────────────────────────────────
+
+class FlatResponseWithFlag(BaseModel):
+    """FlatResponse extended with AI flag fields for admin endpoints."""
+    id: int
+    floor_id: int
+    unit_number: str
+    unit_ulpin: Optional[str] = None
+    unit_type: str
+    area_sqm: Optional[float] = None
+    owner_name: Optional[str] = None
+    created_at: Any
+    updated_at: Any
+    flag_status: Optional[str] = "clean"
+    flag_reason: Optional[str] = None
+    flag_score: Optional[float] = None
+
+    class Config:
+        from_attributes = True
+
+
+class FloorResponseWithFlag(BaseModel):
+    """FloorResponse extended with AI flag fields for admin endpoints."""
+    id: int
+    parcel_feature_id: int
+    floor_number: int
+    floor_ulpin: Optional[str] = None
+    floor_label: str
+    elevation_base_m: float = 0.0
+    elevation_top_m: float = 3.0
+    height_m: float = 3.0
+    created_at: Any
+    updated_at: Any
+    flats: List[FlatResponseWithFlag] = []
+    flat_count: int = 0
+    flag_status: Optional[str] = "clean"
+    flag_reason: Optional[str] = None
+    flag_score: Optional[float] = None
+
+    class Config:
+        from_attributes = True
+
+
+class FeatureDetailResponseWithFlag(BaseModel):
+    """FeatureDetailResponse extended with AI flag fields and building ULPIN history."""
+    id: int
+    parcel_id: int
+    fid: Optional[int] = None
+    ulpin_3d: str
+    height: Optional[float] = None
+    area: Optional[float] = None
+    floor_level: int
+    floor_count: int
+    floor_height_m: float = 3.0
+    building_type: Optional[str] = None
+    feature_name: Optional[str] = None
+    notes: Optional[str] = None
+    defined_floor_count: int = 0
+    building_ulpin_assigned_at: Optional[str] = None
+    building_ulpin_reassigned_by: Optional[int] = None
+    building_ulpin_history: Optional[str] = None
+    flag_status: Optional[str] = "clean"
+    flag_reason: Optional[str] = None
+    flag_score: Optional[float] = None
+
+    class Config:
+        from_attributes = True
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Feature D: Bulk Floor ULPIN Schemas
+# ─────────────────────────────────────────────────────────────────────────────
+
+class FloorBulkAssignRequest(BaseModel):
+    force: bool = Field(False, description="Whether to force-reissue floors that already have a ULPIN")
+
+
+class FloorBulkAssignResponse(BaseModel):
+    feature_id: int
+    total_floors: int
+    assigned_count: int
+    skipped_count: int
+    failed_count: int
+    assigned: List[dict] = []
+    skipped: List[dict] = []
+    failed: List[dict] = []
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Feature F: Building-Level ULPIN Update Schemas
+# ─────────────────────────────────────────────────────────────────────────────
+
+class BuildingUlpinUpdateRequest(BaseModel):
+    ulpin: Optional[str] = Field(None, description="Explicit manual ULPIN")
+    action: Optional[str] = Field("set", description="set or generate")
+    notes: Optional[str] = Field(None, description="Surveyor resolution or reassignment notes")
+
+
+class BuildingUlpinUpdateResponse(BaseModel):
+    id: int
+    ulpin_3d: str
+    status: str = "assigned"
+    message: str
+    previous_ulpin: Optional[str] = None
+    flag_resolved: bool = False
+    flag_status: str = "clean"
