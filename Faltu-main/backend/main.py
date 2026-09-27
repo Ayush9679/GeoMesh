@@ -150,6 +150,9 @@ app.add_middleware(
         "http://127.0.0.1:3000",
         "https://causatively-gonangial-jennefer.ngrok-free.dev",
         "http://causatively-gonangial-jennefer.ngrok-free.dev",
+        "https://geomesh-three.vercel.app",
+        "https://geomesh3d.vercel.app",
+
     ],
     # Permit common local hosts and ngrok domains during development only.
     allow_origin_regex=r"^https?:\/\/([a-zA-Z0-9-]+\.)*(ngrok-free\.dev|ngrok-free\.app|ngrok\.io|localhost|127\.0\.0\.1)(:[0-9]+)?$",
